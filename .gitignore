@@ -161,5 +161,7 @@ cython_debug/
 # Data folders
 data/**/*
 dataset/**/*
+!dataset/custom_dataset.py
+
 preprocessed_data/**/*
 samples/**/*

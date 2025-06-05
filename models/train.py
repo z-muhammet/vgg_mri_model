@@ -85,6 +85,13 @@ REGULARIZATION_FACTOR = 0.1  # Regularization azaltıldı (önceki 0.1'di)
 # Regularization faktörü bu değeri geçemez
 MAX_REGULARIZATION = 0.3   # Maximum regularization azaltıldı (önceki 0.5'ti)
 
+# Rollback parameters
+ROLLBACK_ACC_THRESHOLD = 0.015  # 1.5% accuracy drop threshold
+ROLLBACK_LOSS_THRESHOLD = 0.04  # 4% loss increase threshold
+ROLLBACK_COOLDOWN = 3  # Minimum epochs between rollbacks
+MAX_TOTAL_ROLLBACKS = 10  # Maximum total rollbacks during training
+ROLLBACK_WINDOW = 20  # Window to check for rollback activity
+
 class DynamicRegularization:
     def __init__(self, model, initial_factor=0.1, max_factor=0.5):
         self.model = model
@@ -239,58 +246,76 @@ def should_open_block(epoch, val_acc, train_acc, val_loss, train_loss):
 
 def handle_rollback(model, cache, current_metrics, optim, regularizer, scheduler):
     """
-    Handles rollback logic based on different conditions
-    Returns: (should_rollback, rollback_epochs, new_lr)
+    Updated rollback logic based on new rules:
+    - Only triggers on significant accuracy drop (≥1.5%) or loss increase (≥4%)
+    - Implements cooldown period between rollbacks
+    - Tracks total rollbacks and disables after inactivity
     """
-    if len(cache) < 2:  # En az 2 epoch'luk cache gerekli
+    if len(cache) < 2:  # Need at least 2 epochs of cache
         return False, 0, None
         
     current_val_acc = current_metrics['val_acc']
     current_val_loss = current_metrics['val_loss']
     
-    # Son 3 epoch'un metriklerini al
-    recent_metrics = cache[-3:]
+    # Get previous metrics
+    prev_metrics = cache[-1]
+    prev_val_acc = prev_metrics['val_acc']
+    prev_val_loss = prev_metrics['val_loss']
     
-    # Validation accuracy'deki değişim oranı
-    acc_change = abs(current_val_acc - recent_metrics[0]['val_acc']) / (recent_metrics[0]['val_acc'] + 1e-8)
+    # Calculate changes
+    acc_drop = (prev_val_acc - current_val_acc) / (prev_val_acc + 1e-8)
+    loss_rise = (current_val_loss - prev_val_loss) / (prev_val_loss + 1e-8)
     
-    # Validation loss'daki değişim oranı
-    loss_change = abs(current_val_loss - recent_metrics[0]['val_loss']) / (recent_metrics[0]['val_loss'] + 1e-8)
-    
-    # Yüksek accuracy durumunda farklı strateji
-    if current_val_acc > 0.85:
-        if acc_change < 0.01:  # Eşik artırıldı (0.005'ten 0.01'e)
-            return True, 2, optim.param_groups[0]['lr'] * 0.7  # Daha az agresif düşüş (0.5'ten 0.7'ye)
-        return False, 0, None  # Yüksek accuracy'de rollback yapma
-    
-    # Learning rate değişikliği sonrası performans düşüşü
-    if len(cache) >= 2 and 'lr_changed' in cache[-1]:
-        prev_acc = cache[-2]['val_acc']
-        if current_val_acc < prev_acc * 0.85:  # Eşik artırıldı (0.70'ten 0.85'e)
-            return True, 1, optim.param_groups[0]['lr'] * 0.8  # Daha az agresif düşüş (0.7'den 0.8'e)
+    # Check if we're in cooldown period
+    if hasattr(handle_rollback, 'cooldown_counter') and handle_rollback.cooldown_counter > 0:
+        handle_rollback.cooldown_counter -= 1
         return False, 0, None
     
-    # Overfitting durumu (accuracy gap > 0.20)
-    if acc_change > 0.20:  # Eşik düşürüldü (0.25'ten 0.20'ye)
-        if acc_change > 0.40:  # Eşik düşürüldü (0.5'ten 0.40'a)
-            return True, 2, optim.param_groups[0]['lr'] * 0.8  # Daha az agresif düşüş (0.7'den 0.8'e)
-        else:  # Hafif overfitting
-            return True, 1, optim.param_groups[0]['lr'] * 0.8
+    # Check if we've exceeded total rollback limit
+    if not hasattr(handle_rollback, 'total_rollbacks'):
+        handle_rollback.total_rollbacks = 0
+    if handle_rollback.total_rollbacks >= MAX_TOTAL_ROLLBACKS:
+        return False, 0, None
     
-    # Underfitting durumu (accuracy gap < 0.20)
-    if acc_change < 0.20 and current_val_acc < 0.55:
-        if acc_change < 0.10 and len(cache) >= 3:  # Ciddi underfitting
-            return True, 2, optim.param_groups[0]['lr'] * 1.5
-        else:  # Hafif underfitting
-            return True, 1, optim.param_groups[0]['lr'] * 1.3
+    # Check if we've been inactive for too long
+    if not hasattr(handle_rollback, 'last_rollback_epoch'):
+        handle_rollback.last_rollback_epoch = 0
+    current_epoch = len(cache)
+    if current_epoch - handle_rollback.last_rollback_epoch > ROLLBACK_WINDOW:
+        return False, 0, None
     
-    # Validation loss'da ani artış
-    if loss_change > 0.5:
-        return True, 1, optim.param_groups[0]['lr'] * 0.8  # Daha az agresif düşüş (0.7'den 0.8'e)
+    # Determine if rollback should occur
+    should_rollback = False
+    if acc_drop >= ROLLBACK_ACC_THRESHOLD or loss_rise >= ROLLBACK_LOSS_THRESHOLD:
+        should_rollback = True
+    
+    # Print diagnostic information
+    print(f"{YELLOW}[ROLLBACK-DIAG] Acc Drop: {acc_drop:.4f}, Loss Rise: {loss_rise:.4f}, "
+          f"Should Rollback: {should_rollback}, Cooldown: {getattr(handle_rollback, 'cooldown_counter', 0)}{RESET}")
+    
+    if should_rollback:
+        # Update rollback tracking
+        handle_rollback.total_rollbacks += 1
+        handle_rollback.last_rollback_epoch = current_epoch
+        handle_rollback.cooldown_counter = ROLLBACK_COOLDOWN
+        
+        # Calculate new learning rate
+        new_lr = optim.param_groups[0]['lr'] * 0.8
+        
+        # Clear lr_changed flag in cache
+        if len(cache) > 0:
+            cache[-1]['lr_changed'] = False
+        
+        return True, 1, new_lr
     
     return False, 0, None
 
 def train():
+    # Add rollback tracking variables
+    handle_rollback.cooldown_counter = 0
+    handle_rollback.total_rollbacks = 0
+    handle_rollback.last_rollback_epoch = 0
+    
     # CUDA optimizasyonları
     torch.backends.cudnn.benchmark = True
     torch.backends.cudnn.deterministic = False
