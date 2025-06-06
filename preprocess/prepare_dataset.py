@@ -5,8 +5,8 @@ import random
 # Etiketler
 LABEL_MAP = {
     "brain_glioma": "0_glioma",
-    "brain_menin": "1_meningioma",
-    "brain_tumor": "2_unknown"
+    "brain_menin": "1_menin",
+    "brain_tumor": "2_tumor"
 }
 print(os.listdir("data"))
 
