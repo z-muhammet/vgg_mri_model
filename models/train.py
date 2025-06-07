@@ -19,6 +19,10 @@ import numpy as np
 from sklearn.metrics import confusion_matrix
 import gc  # Garbage collector için eklendi
 from torch.optim.lr_scheduler import ReduceLROnPlateau, CosineAnnealingWarmRestarts
+from dataclasses import dataclass, field
+from typing import List, Tuple, Optional, Dict
+import math
+import platform
 
 # ANSI renk kodları
 RED = '\033[91m'
@@ -50,7 +54,7 @@ class FocalLoss(torch.nn.Module):
 
 # Hyperparameters
 INITIAL_LR = 5e-3  # Learning rate düşürüldü (5e-2'den 5e-3'e)
-BATCH_SIZE = 16    # Batch size artırıldı
+BATCH_SIZE = 8    # Batch size 8 olarak ayarlandı
 NUM_EPOCHS = 60
 WARMUP_EPOCHS = 3
 EARLY_STOPPING_PATIENCE = 10
@@ -92,547 +96,386 @@ ROLLBACK_COOLDOWN = 3  # Minimum epochs between rollbacks
 MAX_TOTAL_ROLLBACKS = 10  # Maximum total rollbacks during training
 ROLLBACK_WINDOW = 20  # Window to check for rollback activity
 
-class DynamicRegularization:
+class DynamicRegularization(nn.Module):
     def __init__(self, model, initial_factor=0.1, max_factor=0.5):
+        super().__init__()
         self.model = model
         self.factor = initial_factor
         self.max_factor = max_factor
         self.original_dropout_rates = {}
         self.store_original_rates()
-        
+
     def store_original_rates(self):
         for name, module in self.model.named_modules():
             if isinstance(module, nn.Dropout2d):
                 self.original_dropout_rates[name] = module.p
-                
+
     def increase_regularization(self):
         self.factor = min(self.factor * 1.5, self.max_factor)
         self.apply_regularization()
-        
+
     def decrease_regularization(self):
         self.factor = max(self.factor / 1.5, REGULARIZATION_FACTOR)
         self.apply_regularization()
-        
+
     def apply_regularization(self):
         for name, module in self.model.named_modules():
             if isinstance(module, nn.Dropout2d):
                 original_rate = self.original_dropout_rates[name]
                 module.p = min(original_rate * (1 + self.factor), 0.9)
 
-def build_dataloaders():
-    # Tıbbi görüntüler için özel augmentation
-    medical_aug = T.Compose([
-        T.ToImage(),
-        T.ToDtype(torch.float32, scale=True),
-        T.RandomAffine(degrees=0, translate=(0.1, 0.1)),  # Küçük kaydırmalar
-        T.RandomRotation(degrees=10),  # Küçük açılı döndürme
-        T.RandomHorizontalFlip(p=0.5),
-        T.RandomVerticalFlip(p=0.5),
-        T.GaussianBlur(kernel_size=3, sigma=(0.1, 1.0)),  # Hafif bulanıklaştırma
-    ])
-    
-    # Validation için sadece temel dönüşümler
-    val_transform = T.Compose([
-        T.ToImage(),
-        T.ToDtype(torch.float32, scale=True)
-    ])
-    
-    train_ds = CustomTumorDataset("preprocessed_data/train", transform=medical_aug)
-    val_ds   = CustomTumorDataset("preprocessed_data/val",   transform=val_transform)
-    
-    print(f"{CYAN}[LOG] Eğitim veri kümesinin sinif listesi:{RESET}", train_ds.classes)
-    print(f"{CYAN}[LOG] valid veri kümesinin sinif listesi:{RESET}", val_ds.classes)
-    train_labels = [label for _, label in train_ds.samples]
-    val_labels   = [label for _, label in val_ds.samples]
-    print(f"{CYAN}[LOG] train label dağılımı:{RESET}", Counter(train_labels))
-    print(f"{CYAN}[LOG] valid label dağılımı:{RESET}", Counter(val_labels))
-    
-    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True,
-                             num_workers=2,
-                             pin_memory=True,
-                             persistent_workers=True,
-                             prefetch_factor=2)
-    val_loader   = DataLoader(val_ds,   batch_size=BATCH_SIZE*2, shuffle=False,
-                             num_workers=2,
-                             pin_memory=True,
-                             persistent_workers=True,
-                             prefetch_factor=2)
-    return train_loader, val_loader
+# ---------- Trainer State dataclass -------------------------------------------------------------
+@dataclass
+class TrainerState:
+    best_acc: float = 0.0
+    best_loss: float = math.inf
+    best_weights: Optional[dict] = None
+    epoch: int = 0
+    last_rb_epoch: int = 0
+    total_rbs: int = 0
+    cooldown: int = 0
 
-def run_epoch(model, loader, criterion, optim=None, gpu_aug=None, scaler=None):
-    train = optim is not None
-    model.train() if train else model.eval()
-    tot_loss = correct = total = 0
+# ---------- Trainer -----------------------------------------------------------------------------
+class Trainer(nn.Module): # Inherit from nn.Module for DynamicRegularization
+    def __init__(
+        model: nn.Module,
+        *,
+        train_loader: DataLoader,
+        val_loader: DataLoader,
+        device: torch.device,
+        lr: float = 1e-3,
+        max_epochs: int = 60,
+        overfit_thr: float = 0.25,
+        underfit_thr: float = 0.55,
+        plot_every: int = 5,
+        checkpoint_dir: str = "models",
+        class_weights=None
+    ) -> None:
+        super().__init__() # Call super constructor
+        self.model = model.to(device)
+        self.device = device
+        self.train_loader = train_loader
+        self.val_loader = val_loader
+        self.max_epochs = max_epochs
+        self.overfit_thr = overfit_thr
+        self.underfit_thr = underfit_thr
+        self.plot_every = plot_every
+        os.makedirs(checkpoint_dir, exist_ok=True)
+        self.ckpt_path = os.path.join(checkpoint_dir, "best_vgg_custom.pt")
+        self.optim = torch.optim.AdamW(self.model.parameters(), lr=3e-4, weight_decay=1e-4)
+        self.criterion = nn.CrossEntropyLoss(weight=class_weights)
+        self.amp_enabled = self.device.type == "cuda" and (hasattr(torch.cuda, "is_bf16_supported") and torch.cuda.is_bf16_supported())
+        self.scaler = GradScaler(enabled=self.amp_enabled)
+        self.scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(self.optim, T_0=10, T_mult=2)
+        # DynamicRegularization should be a part of the Trainer module to be saved/loaded correctly
+        self.regulariser = DynamicRegularization(self.model, initial_factor=REGULARIZATION_FACTOR)
+        self.state = TrainerState()
+        self.hist: List[dict] = []  # for plotting
+        self.last_lr = lr
 
-    if train:
-        iterator = tqdm(loader, leave=True, desc="Train")
-    else:
-        iterator = loader
-
-    for i, (X, y) in enumerate(iterator):
-        X, y = X.to(DEVICE, non_blocking=True), y.to(DEVICE, non_blocking=True)
-        # GPU augmentation kaldırıldı
-        
-        with torch.set_grad_enabled(train):
-            with autocast('cuda', enabled=True):
-                out = model(X)
-                loss = criterion(out, y)
-                if train:
-                    loss = loss / 2  # Gradient accumulation steps
-            
+    def _run_epoch(self, train: bool = True) -> Tuple[float, float]:
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        loader = self.train_loader if train else self.val_loader
+        self.model.train(mode=train)
+        tot_loss = correct = total = 0
+        pbar = loader if not train else tqdm(loader, desc="Train", leave=False)
+        for i, (X, y) in enumerate(pbar):
+            y = y.long()  # Etiket tipi zorunlu long
+            if i == 0:
+                print(f"[BatchLog] {'Train' if train else 'Val'} batch0 labels: {y.tolist()} | tensor min: {X.min().item():.3f}, max: {X.max().item():.3f} | label min: {y.min().item()}, max: {y.max().item()}, NaN: {torch.isnan(X).any().item() or torch.isnan(y).any().item()}")
+            X, y = X.to(self.device, non_blocking=True), y.to(self.device, non_blocking=True)
+            with autocast(device_type=self.device.type, enabled=self.amp_enabled):
+                out = self.model(X)
+                loss = self.criterion(out, y)
             if train:
-                scaler.scale(loss).backward()
-                if (i + 1) % 2 == 0:
-                    scaler.unscale_(optim)
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                    scaler.step(optim)
-                    scaler.update()
-                    optim.zero_grad(set_to_none=True)
+                self.scaler.scale(loss).backward()
+                self.scaler.step(self.optim)
+                self.scaler.update()
+                self.optim.zero_grad(set_to_none=True)
+            tot_loss += loss.item() * y.size(0)
+            correct += (out.argmax(1) == y).sum().item()
+            total += y.size(0)
+            del X, y, out, loss
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        return tot_loss / total, correct / total # Corrected indentation and placement
 
-        tot_loss += loss.item() * y.size(0) * 2
-        correct += (out.argmax(1) == y).sum().item()
-        total += y.size(0)
+    def _maybe_rollback(self, val_acc: float, val_loss: float):
+        cfg_acc_drop = 0.015
+        cfg_loss_rise = 0.04
+        cooldown_epochs = 3
 
-        # Her batch sonrası bellek temizliği
-        del X, y, out, loss
-        torch.cuda.empty_cache()
-        if i % 10 == 0:  # Her 10 batch'te bir garbage collection
-            gc.collect()
+        # Need at least 1 previous epoch in history to compare against.
+        # _log_epoch adds the *current* epoch's state after this is called.
+        # So if len(self.hist) == 0, there's no previous epoch to compare to.
+        if len(self.hist) < 1:
+            return
 
-    return tot_loss / total, correct / total
+        # Get the state and metrics of the previous epoch (the last one logged).
+        prev_state = self.hist[-1]
 
-def plot_metrics(train_acc_hist, val_acc_hist, train_loss_hist, val_loss_hist, lr_hist):
-    plt.figure(figsize=(15, 10))
-    
-    # Accuracy plot
-    plt.subplot(2, 1, 1)
-    plt.plot(train_acc_hist, label='Train Accuracy', color='blue')
-    plt.plot(val_acc_hist, label='Validation Accuracy', color='red')
-    plt.title('Model Accuracy Over Time')
-    plt.xlabel('Epoch')
-    plt.ylabel('Accuracy')
-    plt.legend()
-    plt.grid(True)
-    
-    # Loss plot
-    plt.subplot(2, 1, 2)
-    plt.plot(train_loss_hist, label='Train Loss', color='blue')
-    plt.plot(val_loss_hist, label='Validation Loss', color='red')
-    plt.title('Model Loss Over Time')
-    plt.xlabel('Epoch')
-    plt.ylabel('Loss')
-    plt.legend()
-    plt.grid(True)
-    
-    plt.tight_layout()
-    plt.savefig('training_logs.png')
-    plt.close()
+        # Compare current epoch's performance (val_acc, val_loss) with the previous epoch's metrics (prev_state)
+        acc_drop = (prev_state["val_acc"] - val_acc) / (prev_state["val_acc"] + 1e-8)
+        loss_rise = (val_loss - prev_state["val_loss"]) / (prev_state["val_loss"] + 1e-8)
 
-# Block opening strategy
-def should_open_block(epoch, val_acc, train_acc, val_loss, train_loss):
-    # İlk 3 epoch'ta blok açma
-    if epoch <= 3:
-        return True
-        
-    # Validation accuracy 0.85'i geçtiyse ve train/val farkı 0.1'den küçükse
-    if val_acc > 0.85 and abs(train_acc - val_acc) < 0.1:
-        return True
-        
-    # Validation loss 0.3'ün altındaysa
-    if val_loss < 0.3:
-        return True
-        
-    return False
+        # Check if rollback conditions are met and if the previous state has weights (should always if logging successful)
+        if (
+            acc_drop >= cfg_acc_drop or loss_rise >= cfg_loss_rise
+        ) and self.state.cooldown == 0 and self.state.total_rbs < MAX_TOTAL_ROLLBACKS and "weights" in prev_state: # Check prev_state for 'weights'
+            print(f"\n{YELLOW}[Rollback] Triggered! Δacc={acc_drop:.3f}, Δloss={loss_rise:.3f} → restoring previous weights (epoch {prev_state['epoch']}){RESET}") # Use epoch from prev_state
+            try:
+                # Load the state dicts from the previous epoch
+                if "weights" in prev_state and "optim_state" in prev_state:
+                    self.model.load_state_dict(prev_state["weights"])
+                    self.optim.load_state_dict(prev_state["optim_state"])
+                    self.state.total_rbs += 1
+                    # Update last_rb_epoch to the epoch we rolled back to
+                    self.state.last_rb_epoch = prev_state['epoch']
+                    self.state.cooldown = cooldown_epochs
+                    print(f"{YELLOW}[Rollback] Total rollbacks: {self.state.total_rbs}, Cooldown: {self.state.cooldown} epochs\n{RESET}")
+                else:
+                    print(f"{RED}[Rollback Error] Previous epoch state in history does not contain 'weights' or 'optim_state' keys. Cannot rollback for epoch {prev_state['epoch']}.{RESET}")
+            except Exception as e:
+                 print(f"{RED}[Rollback Error] Could not load state dicts for epoch {prev_state['epoch']}: {e}{RESET}")
+                 # If rollback fails, perhaps we should stop or handle differently.
+                 # For now, just log the error and continue.
 
-def handle_rollback(model, cache, current_metrics, optim, regularizer, scheduler):
-    """
-    Updated rollback logic based on new rules:
-    - Only triggers on significant accuracy drop (≥1.5%) or loss increase (≥4%)
-    - Implements cooldown period between rollbacks
-    - Tracks total rollbacks and disables after inactivity
-    """
-    if len(cache) < 2:  # Need at least 2 epochs of cache
-        return False, 0, None
-        
-    current_val_acc = current_metrics['val_acc']
-    current_val_loss = current_metrics['val_loss']
-    
-    # Get previous metrics
-    prev_metrics = cache[-1]
-    prev_val_acc = prev_metrics['val_acc']
-    prev_val_loss = prev_metrics['val_loss']
-    
-    # Calculate changes
-    acc_drop = (prev_val_acc - current_val_acc) / (prev_val_acc + 1e-8)
-    loss_rise = (current_val_loss - prev_val_loss) / (prev_val_loss + 1e-8)
-    
-    # Check if we're in cooldown period
-    if hasattr(handle_rollback, 'cooldown_counter') and handle_rollback.cooldown_counter > 0:
-        handle_rollback.cooldown_counter -= 1
-        return False, 0, None
-    
-    # Check if we've exceeded total rollback limit
-    if not hasattr(handle_rollback, 'total_rollbacks'):
-        handle_rollback.total_rollbacks = 0
-    if handle_rollback.total_rollbacks >= MAX_TOTAL_ROLLBACKS:
-        return False, 0, None
-    
-    # Check if we've been inactive for too long
-    if not hasattr(handle_rollback, 'last_rollback_epoch'):
-        handle_rollback.last_rollback_epoch = 0
-    current_epoch = len(cache)
-    if current_epoch - handle_rollback.last_rollback_epoch > ROLLBACK_WINDOW:
-        return False, 0, None
-    
-    # Determine if rollback should occur
-    should_rollback = False
-    if acc_drop >= ROLLBACK_ACC_THRESHOLD or loss_rise >= ROLLBACK_LOSS_THRESHOLD:
-        should_rollback = True
-    
-    # Print diagnostic information
-    print(f"{YELLOW}[ROLLBACK-DIAG] Acc Drop: {acc_drop:.4f}, Loss Rise: {loss_rise:.4f}, "
-          f"Should Rollback: {should_rollback}, Cooldown: {getattr(handle_rollback, 'cooldown_counter', 0)}{RESET}")
-    
-    if should_rollback:
-        # Update rollback tracking
-        handle_rollback.total_rollbacks += 1
-        handle_rollback.last_rollback_epoch = current_epoch
-        handle_rollback.cooldown_counter = ROLLBACK_COOLDOWN
-        
-        # Calculate new learning rate
-        new_lr = optim.param_groups[0]['lr'] * 0.8
-        
-        # Clear lr_changed flag in cache
-        if len(cache) > 0:
-            cache[-1]['lr_changed'] = False
-        
-        return True, 1, new_lr
-    
-    return False, 0, None
 
-def train():
-    # Add rollback tracking variables
-    handle_rollback.cooldown_counter = 0
-    handle_rollback.total_rollbacks = 0
-    handle_rollback.last_rollback_epoch = 0
-    
-    # CUDA optimizasyonları
-    torch.backends.cudnn.benchmark = True
-    torch.backends.cudnn.deterministic = False
-    torch.backends.cuda.matmul.allow_tf32 = True
-    torch.backends.cudnn.allow_tf32 = True
-    
-    train_loader, val_loader = build_dataloaders()
+    def _maybe_open_block(self, val_acc: float, val_loss: float):
+        opened = self.model.opened_blocks
+        # Can only open blocks up to the total number of blocks - 1 (since opened_blocks is 0-indexed for next block)
+        if opened >= len(self.model.blocks):
+            return
+        # Stagnation check: if validation loss has not improved significantly in the last few epochs
+        # Use a window size that makes sense, e.g., half the rollback window or at least 2 epochs.
+        stagnation_window = max(2, min(len(self.hist), ROLLBACK_WINDOW // 2))
+        # We need enough history entries to check for stagnation over the window
+        if len(self.hist) < stagnation_window:
+            return
 
-    model = VGGCustom(num_classes=len(train_loader.dataset.classes)).to(DEVICE)
-    optim = torch.optim.AdamW(model.parameters(), lr=INITIAL_LR, weight_decay=0.01)
-    criterion = torch.nn.CrossEntropyLoss()
-    scaler = GradScaler('cuda')
-    
-    # GPU augmentation kaldırıldı
-    gpu_aug = None
+        # Check if val loss in the last 'stagnation_window' epochs is mostly >= current val_loss
+        # Access history from the end: hist[-1] is most recent, hist[-stagnation_window] is the oldest in the window
+        stagnant = all(h["val_loss"] >= val_loss for h in self.hist[-stagnation_window:])
 
-    # Cache boyutunu sınırla
-    max_cache_size = 5
-    cache = []
-    stuck_count = 0
-    window = 6
-    val_loss_hist = []
-    val_acc_hist = []
-    train_loss_hist = []
-    train_acc_hist = []
-    best_val_acc = 0
-    best_val_loss = float('inf')
-    patience = EARLY_STOPPING_PATIENCE
-    no_improve_epochs = 0
-    block_no_improve_epochs = 0
-    lr_hist = []
+        # Check if block opening conditions are met
+        # Open the next block if training is stagnant or validation accuracy is high and we haven't opened all blocks
+        # opened_blocks is the count of already opened blocks, which is the index of the NEXT block to open
+        if (stagnant or val_acc > 0.85) and opened < len(self.model.blocks):
+             # Open the block at index 'opened'
+             self.model.freeze_blocks_until(opened) # freeze_blocks_until expects the index of the last block to keep open (inclusive), so passing 'opened' opens block 'opened'
+             # The freeze_blocks_until method should handle the internal opened_blocks count update
+             # Print the index of the block that was just opened (which is 'opened' + 1 if 1-indexed, or just 'self.model.opened_blocks' after the call)
+             print(f"{CYAN}[Block] Block-{self.model.opened_blocks} opened at epoch {self.state.epoch} (val_acc={val_acc:.3f}, val_loss={val_loss:.3f}){RESET}")
 
-    # Eğitim fonksiyonunda, class_weights başlangıçta eşit olarak başlatılır
-    class_weights = torch.ones(3, dtype=torch.float32, device=DEVICE)
 
-    # Initialize regularization and schedulers
-    regularizer = DynamicRegularization(model, REGULARIZATION_FACTOR, MAX_REGULARIZATION)
-    scheduler = CosineAnnealingWarmRestarts(optim, T_0=10, T_mult=2)
-    reduce_lr = ReduceLROnPlateau(optim, mode='max', factor=0.5, patience=5)
-    
-    # Learning rate değişikliği takibi için
-    last_lr = INITIAL_LR
-    
-    # Overfitting/Underfitting tracking
-    overfit_epochs = 0
-    underfit_epochs = 0
-    best_state = None
-    best_epoch = 0
-
-    consecutive_rollbacks = 0
-    skip_epochs = 0
-    last_metrics = None
-    last_rollback_acc = None
-
-    for ep in range(1, NUM_EPOCHS + 1):
-        # Eğer skip_epochs varsa, o kadar epoch'u atla
-        if skip_epochs > 0:
-            print(f"{YELLOW}[!] Skipping epoch {ep} ({skip_epochs} epochs remaining){RESET}")
-            skip_epochs -= 1
-            continue
-
-        t0 = time.time()
-        
-        tr_l, tr_a = run_epoch(model, train_loader, criterion,
-                               optim=optim, gpu_aug=gpu_aug, scaler=scaler)
-        vl_l, vl_a = run_epoch(model, val_loader, criterion)
-
-        current_metrics = {
-            'train_loss': tr_l,
-            'val_loss': vl_l,
-            'train_acc': tr_a,
-            'val_acc': vl_a
+    def _log_epoch(self, tr_acc, tr_loss, val_acc, val_loss):
+        # Create current epoch's history entry
+        cur = {
+            "epoch": self.state.epoch,
+            "train_acc": tr_acc,
+            "train_loss": tr_loss,
+            "val_acc": val_acc,
+            "val_loss": val_loss,
+            "lr": self.optim.param_groups[0]["lr"],
         }
 
-        # Learning rate değişikliği kontrolü
-        current_lr = optim.param_groups[0]['lr']
-        lr_changed = abs(current_lr - last_lr) > 1e-6
-        last_lr = current_lr
+        # Save model and optimizer state for rollback *at the end* of the current epoch.
+        # These states correspond to the model's parameters after completing the current epoch's training/validation.
+        # They will be used to revert *to* this state if a future epoch performs poorly.
+        try:
+            cur["weights"] = copy.deepcopy(self.model.state_dict())
+            cur["optim_state"] = copy.deepcopy(self.optim.state_dict())
+        except Exception as e:
+            print(f"{RED}[Log Epoch Error] Could not deepcopy state dicts for epoch {self.state.epoch}: {e}{RESET}")
+            # If deepcopy fails, we cannot save the state for this epoch for rollback.
+            # This epoch cannot be a target for rollback.
 
-        # Cache güncelle
-        cache.append({
-            "model": copy.deepcopy(model.state_dict()),
-            "optim": copy.deepcopy(optim.state_dict()),
-            "train_loss": tr_l,
-            "val_loss": vl_l,
-            "train_acc": tr_a,
-            "val_acc": vl_a,
-            "lr_changed": lr_changed
-        })
-        if len(cache) > max_cache_size:
-            cache.pop(0)
+        self.hist.append(cur)
 
-        # Geri alma kontrolü
-        should_rollback, rollback_epochs, new_lr = handle_rollback(
-            model, cache, current_metrics, optim, regularizer, scheduler
-        )
+        # Ensure history does not grow indefinitely and keeps recent states for rollback
+        # Keep history size limited. We need enough history for rollback comparisons (ROLLBACK_WINDOW) + 1 for the current epoch state.
+        # Let's keep a small buffer, e.g., ROLLBACK_WINDOW + 2.
+        while len(self.hist) > ROLLBACK_WINDOW + 2:
+             self.hist.pop(0)
 
-        if should_rollback and len(cache) >= rollback_epochs + 1:
-            # Ardışık rollback kontrolü
-            if last_rollback_acc is not None:
-                if abs(current_metrics['val_acc'] - last_rollback_acc) < 0.01:  # Eşik artırıldı (0.005'ten 0.01'e)
-                    consecutive_rollbacks += 1
+
+    def train(self):
+        print("\n=== Training Started ===")
+        print(f"Device: {self.device}, Max Epochs: {self.max_epochs}, LR: {self.optim.param_groups[0]['lr']:.2e}")
+        print(f"Batch Size: {self.train_loader.batch_size}, Scheduler: CosineAnnealingWarmRestarts\n")
+
+        for epoch in range(1, self.max_epochs + 1):
+            self.state.epoch = epoch
+            t0 = time.time()
+
+            # 1. Run training and validation epochs
+            tr_loss, tr_acc = self._run_epoch(train=True)
+            val_loss, val_acc = self._run_epoch(train=False)
+
+            # 2. Step the scheduler
+            self.scheduler.step()
+
+            # 3. Log LR changes
+            current_lr = self.optim.param_groups[0]['lr']
+            if abs(current_lr - self.last_lr) > 1e-8:
+                print(f"{YELLOW}[LR Scheduler] LR changed: {self.last_lr:.2e} → {current_lr:.2e} (epoch {epoch}){RESET}")
+                self.last_lr = current_lr
+
+            # 4. Decrement rollback cooldown
+            if self.state.cooldown > 0:
+                self.state.cooldown -= 1
+
+            # 5. Decide on rollback *before* logging the current epoch's state
+            # This way, _maybe_rollback compares current metrics (epoch N) to the previously logged metrics (epoch N-1)
+            # and if needed, rolls back to the state of epoch N-1.
+            self._maybe_rollback(val_acc, val_loss)
+
+            # 6. Decide on block opening *after* potential rollback
+            # _maybe_open_block uses the metrics of the current epoch (which might be after rollback)
+            self._maybe_open_block(val_acc, val_loss)
+
+            # 7. Adjust regularization based on overfitting/underfitting *after* potential rollback/block opening
+            gap = tr_acc - val_acc
+            if gap > self.overfit_thr:
+                self.regulariser.increase_regularization()
+                print(f"{YELLOW}[Regulariser] Overfit detected (gap={gap:.3f}), regularisation increased to {self.regulariser.factor:.2f}{RESET}")
+            elif val_acc < self.underfit_thr:
+                self.regulariser.decrease_regularization()
+                print(f"{YELLOW}[Regulariser] Underfit detected (val_acc={val_acc:.3f}), regularisation decreased to {self.regulariser.factor:.2f}{RESET}")
+
+            # 8. Log the final state and metrics of the *current* epoch (after all adjustments)
+            self._log_epoch(tr_acc, tr_loss, val_acc, val_loss)
+
+            # 9. Save checkpoint based on the final metrics of the current epoch
+            if val_acc > self.state.best_acc:
+                self.state.best_acc = val_acc
+                self.state.best_loss = val_loss
+                # Save the state dict that was just logged (represents the best state found so far)
+                # Access the last saved state from history, which includes weights/optim_state
+                best_state_for_save = self.hist[-1] if len(self.hist) > 0 and "weights" in self.hist[-1] else None
+
+                if best_state_for_save:
+                    try:
+                        # Save the weights from the history entry
+                        torch.save(best_state_for_save["weights"], self.ckpt_path)
+                        print(f"{GREEN}[Checkpoint] New best model saved at epoch {epoch} (val_acc={val_acc:.3f}){RESET}")
+                    except Exception as e:
+                        print(f"{RED}[Checkpoint Error] Could not save checkpoint for epoch {epoch}: {e}{RESET}")
                 else:
-                    consecutive_rollbacks = 1
-            else:
-                consecutive_rollbacks = 1
+                    print(f"{RED}[Checkpoint Warning] Best accuracy achieved at epoch {epoch} ({val_acc:.3f}), but state dict not found in history to save.{RESET}")
 
-            if consecutive_rollbacks >= 3:
-                print(f"{YELLOW}[!] 3 consecutive rollbacks detected! Skipping next 2 epochs{RESET}")
-                skip_epochs = 2
-                consecutive_rollbacks = 0
-                last_rollback_acc = None
-                continue
+            # 10. Print epoch summary log
+            dt = time.time() - t0
 
-            print(f"{YELLOW}[!] Rollback triggered! Going back {rollback_epochs} epochs{RESET}")
-            
-            # Model ve optimizer durumunu geri al
-            rollback_state = cache[-(rollback_epochs + 1)]
-            model.load_state_dict(rollback_state['model'])
-            optim.load_state_dict(rollback_state['optim'])
-            
-            # Learning rate güncelle
-            if new_lr is not None:
-                for param_group in optim.param_groups:
-                    param_group['lr'] = new_lr
-                print(f"{YELLOW}[!] Learning rate adjusted to: {new_lr:.2e}{RESET}")
-                # Scheduler'ları sıfırla
-                scheduler = CosineAnnealingWarmRestarts(optim, T_0=10, T_mult=2)
-                reduce_lr = ReduceLROnPlateau(optim, mode='max', factor=0.5, patience=5)
-            
-            # Cache'i güncelle
-            cache = cache[:-(rollback_epochs)]
-            last_rollback_acc = current_metrics['val_acc']
-            
-            # Epoch'u tekrar çalıştır
-            continue
+            # Simplied block info for log format
+            block_info = f"{self.model.opened_blocks}/{len(self.model.blocks)}"
 
-        last_metrics = current_metrics
+            # Use ANSI colors for improved readability - Updated format
+            print(
+                f"{GREEN}Epoch {epoch:02d}{RESET} | "
+                f"TrainAcc {BLUE}{tr_acc:.3f}{RESET} | "
+                f"ValAcc {BLUE}{val_acc:.3f}{RESET} | "
+                f"TrainLoss {RED}{tr_loss:.3f}{RESET} | "
+                f"ValLoss {RED}{val_loss:.3f}{RESET} | "
+                f"LR {YELLOW}{self.optim.param_groups[0]['lr']:.2e}{RESET} | "
+                f"Blocks opened: {YELLOW}{block_info}{RESET} | "
+                f"⏱️ {CYAN}{dt:.1f}s{RESET}"
+            )
 
-        # Validation sonrası dinamik class weight güncellemesi
-        if ep % 3 == 0:
-            all_val_labels = []
-            all_val_preds = []
-            model.eval()
-            with torch.no_grad():
-                for X, y in val_loader:
-                    X, y = X.to(DEVICE), y.to(DEVICE)
-                    out = model(X)
-                    preds = out.argmax(1)
-                    all_val_labels.extend(y.cpu().numpy())
-                    all_val_preds.extend(preds.cpu().numpy())
-                    del X, y, out, preds
-                    torch.cuda.empty_cache()
-            cm = confusion_matrix(all_val_labels, all_val_preds, labels=[0,1,2])
-            print(f"{YELLOW}[DYN-WEIGHT][Ep{ep}] Confusion Matrix:{RESET}\n{cm}")
-            fp = np.zeros(3)
-            for c in range(3):
-                fp[c] = cm[:,c].sum() - cm[c,c]
-            total = np.sum(cm)
-            penalty_ratio = fp / (total + 1e-8)
-            print(f"{YELLOW}[DYN-WEIGHT][Ep{ep}] False Positive: {fp}, Penalty Ratio: {penalty_ratio}{RESET}")
-            old_weights = class_weights.cpu().numpy().copy()
-            for c in range(3):
-                class_weights[c] = max(min_weight, class_weights[c] * (1 - lambda_penalty * penalty_ratio[c]))
-            class_weights = class_weights / class_weights.sum() * 3
-            print(f"{YELLOW}[DYN-WEIGHT][Ep{ep}] Old Weights: {old_weights}, New Weights: {class_weights.cpu().numpy()}{RESET}")
-            criterion = torch.nn.CrossEntropyLoss(weight=class_weights)
+            # TrainerState logu - Updated format to match example
+            print(f"{CYAN}[TrainerState]{RESET} epoch={self.state.epoch}, best_acc={self.state.best_acc:.3f}, total_rollbacks={self.state.total_rbs}, cooldown={self.state.cooldown}") # Removed best_loss as it wasn't in your example
 
-        # Agresif bellek temizliği
-        torch.cuda.empty_cache()
-        gc.collect()
+            # 11. Plot history if needed
+            if epoch % self.plot_every == 0 or epoch == self.max_epochs:
+                self._plot_history()
+                print(f"{MAGENTA}[Plotting] Saved training curves at epoch {epoch}.{RESET}")
 
-        train_loss_hist.append(tr_l)
-        val_loss_hist.append(vl_l)
-        train_acc_hist.append(tr_a)
-        val_acc_hist.append(vl_a)
-        if len(val_loss_hist) > window:
-            val_loss_hist.pop(0)
-            train_loss_hist.pop(0)
-            val_acc_hist.pop(0)
-            train_acc_hist.pop(0)
+            # 12. Early stopping check
+            if val_acc >= 0.958:
+                print(f"{GREEN}Target accuracy reached – stopping early.{RESET}")
+                break # Corrected placement inside the loop
 
-        # Overfitting detection and prevention
-        accuracy_gap = tr_a - vl_a
-        if accuracy_gap > OVERFIT_THRESHOLD:
-            overfit_epochs += 1
-            if overfit_epochs >= MAX_OVERFIT_EPOCHS:
-                print(f"{RED}[!] Overfitting detected! Increasing regularization...{RESET}")
-                regularizer.increase_regularization()
-                # Recover best state
-                if best_state is not None:
-                    model.load_state_dict(best_state)
-                    print(f"{GREEN}[✓] Recovered best model state from epoch {best_epoch}{RESET}")
-                overfit_epochs = 0
-        else:
-            overfit_epochs = 0
-            
-        # Underfitting detection and prevention
-        if vl_a < UNDERFIT_THRESHOLD:
-            underfit_epochs += 1
-            if underfit_epochs >= MAX_UNDERFIT_EPOCHS:
-                print(f"{RED}[!] Underfitting detected! Decreasing regularization...{RESET}")
-                regularizer.decrease_regularization()
-                underfit_epochs = 0
-        else:
-            underfit_epochs = 0
-            
-        # Save best state
-        if vl_a > best_val_acc:
-            best_val_acc = vl_a
-            best_state = copy.deepcopy(model.state_dict())
-            best_epoch = ep
-            torch.save(model.state_dict(), "models/best_vgg_custom.pt")
-            print(f"{GREEN}[✓] New best model saved! Accuracy: {vl_a:.4f}{RESET}")
-            
-        # Learning rate scheduling
-        scheduler.step()
-        reduce_lr.step(vl_a)
+            # 13. Clear cache after each epoch
+            torch.cuda.empty_cache()
+            gc.collect()
 
-        # Validation metrics iyileşme kontrolü
-        improved = False
-        if vl_a > best_val_acc:
-            best_val_acc = vl_a
-            improved = True
-        if vl_l < best_val_loss:
-            best_val_loss = vl_l
-            improved = True
-            
-        if improved:
-            no_improve_epochs = 0
-            torch.save(model.state_dict(), "models/best_vgg_custom.pt")
-            print(f"{GREEN}[✓] Yeni en iyi model kaydedildi! Doğruluk: {vl_a:.4f}{RESET}")
-        else:
-            no_improve_epochs += 1
+        print(f"\nTraining finished. Best val-acc = {self.state.best_acc:.3f}")
 
-        if no_improve_epochs >= patience:
-            print(f"{RED}[!] Early stopping: {patience} epoch boyunca iyileşme yok.{RESET}")
-            break
+    def _plot_history(self):
+        xs = [h["epoch"] for h in self.hist]
+        tr_acc = [h["train_acc"] for h in self.hist]
+        val_acc = [h["val_acc"] for h in self.hist]
+        tr_loss = [h["train_loss"] for h in self.hist]
+        val_loss = [h["val_loss"] for h in self.hist]
+        plt.figure(figsize=(10, 5))
+        plt.subplot(1, 2, 1)
+        plt.plot(xs, tr_acc, label="train")
+        plt.plot(xs, val_acc, label="val")
+        plt.xlabel("epoch"); plt.ylabel("acc"); plt.grid(); plt.legend()
+        plt.subplot(1, 2, 2)
+        plt.plot(xs, tr_loss, label="train")
+        plt.plot(xs, val_loss, label="val")
+        plt.xlabel("epoch"); plt.ylabel("loss"); plt.grid(); plt.legend()
+        plt.tight_layout()
+        os.makedirs("logs", exist_ok=True)
+        plt.savefig(f"logs/curve_epoch_{self.state.epoch}.png")
+        plt.close()
 
-        # Progressive block açma - validation loss'a göre
-        opened = sum([any(p.requires_grad for p in blk.parameters()) for blk in model.blocks])
-        if opened == 2:
-            block_open_threshold = 8
-        else:
-            block_open_threshold = 3
-            
-        # Validation loss iyileşme kontrolü - son 3 epoch'a bak
-        if ep > 3 and vl_l > min(val_loss_hist[-3:]):  # Son 3 epoch'un en kötü loss'u
-            block_no_improve_epochs += 1
-        else:
-            block_no_improve_epochs = 0
-            
-        if block_no_improve_epochs >= block_open_threshold and hasattr(model, 'freeze_blocks_until'):
-            if opened < len(model.blocks):
-                model.freeze_blocks_until(opened)
-                print(f"{BLUE}[+] {ep}. epoch → Block-{opened+1} açıldı{RESET}")
-                block_no_improve_epochs = 0
-
-        current_lr = optim.param_groups[0]['lr']
-        print(
-            f"{BOLD}[Ep {ep:02d}]{RESET} "
-            f"TrainAcc: {tr_a:.3f} | ValAcc: {vl_a:.3f} | "
-            f"TrainLoss: {tr_l:.3f} | ValLoss: {vl_l:.3f} | "
-            f"LR: {current_lr:.2e} | NoImp: {no_improve_epochs} | "
-            f"Block: {opened} | "
-            f"Time: {time.time()-t0:.1f}s"
-        )
-
-        if vl_a >= 0.958:
-            print(f"[✓] %{vl_a:.4f} doğruluk – eğitim bitti.")
-            break
-
-        # Her epoch sonunda metrikleri kaydet
-        train_acc_hist.append(tr_a)
-        val_acc_hist.append(vl_a)
-        train_loss_hist.append(tr_l)
-        val_loss_hist.append(vl_l)
-        lr_hist.append(current_lr)
-        
-        # Her epoch sonunda grafik çiz
-        plot_metrics(train_acc_hist, val_acc_hist, train_loss_hist, val_loss_hist, lr_hist)
-
-        # Her epoch sonunda bellek temizliği
-        torch.cuda.empty_cache()
-        gc.collect()
-
-    # Eğitim sonunda grafikleri oluştur
-    plt.figure(figsize=(12, 4))
-    plt.subplot(1, 2, 1)
-    plt.plot(train_acc_hist, label='Train Acc')
-    plt.plot(val_acc_hist, label='Val Acc')
-    plt.xlabel('Epoch')
-    plt.ylabel('Accuracy')
-    plt.legend()
-    plt.title('Accuracy over epochs')
-
-    plt.subplot(1, 2, 2)
-    plt.plot(train_loss_hist, label='Train Loss')
-    plt.plot(val_loss_hist, label='Val Loss')
-    plt.xlabel('Epoch')
-    plt.ylabel('Loss')
-    plt.legend()
-    plt.title('Loss over epochs')
-
-    plt.tight_layout()
-    plt.savefig('logs/training_logs.png')
-    plt.close()
-
-    # Grafik oluşturma sonrası bellek temizliği
-    plt.clf()
-    plt.close('all')
-    torch.cuda.empty_cache()
-    gc.collect()
+def build_dataloaders(batch_size=16, num_workers=2, to_rgb=False, pin_memory=True, persistent_workers=True):
+    import platform
+    if platform.system() == "Windows":
+        num_workers = 0
+        persistent_workers = False
+    aug = T.Compose([
+        T.RandomHorizontalFlip(),
+        T.RandomVerticalFlip(),
+        T.RandomRotation(10),
+    ])
+    train_ds = CustomTumorDataset("preprocessed_data/train", to_rgb=to_rgb, transform=aug)
+    val_ds = CustomTumorDataset("preprocessed_data/val", to_rgb=to_rgb)
+    train_loader = DataLoader(
+        train_ds, batch_size=batch_size, shuffle=True, num_workers=num_workers,
+        pin_memory=pin_memory, persistent_workers=persistent_workers
+    )
+    val_loader = DataLoader(
+        val_ds, batch_size=batch_size, shuffle=True, num_workers=num_workers,
+        pin_memory=pin_memory, persistent_workers=persistent_workers
+    )
+    # Class weights hesapla
+    labels = [label for _, label in train_ds.samples]
+    label_counts = Counter(labels)
+    num_classes = len(label_counts)
+    class_sample_count = torch.tensor([label_counts.get(i, 0) for i in range(num_classes)], dtype=torch.float32)
+    class_weights = 1. / (class_sample_count + 1e-6)
+    class_weights = class_weights / class_weights.sum() * num_classes
+    class_weights = class_weights.to(torch.device('cuda' if torch.cuda.is_available() else 'cpu'))
+    return train_loader, val_loader, class_weights
 
 def freeze_support_for_win():
     mp.set_start_method("spawn", force=True)
 
 if __name__ == "__main__":
     freeze_support_for_win()
-    train()
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    train_loader, val_loader, class_weights = build_dataloaders(
+        batch_size=BATCH_SIZE,
+        num_workers=1,
+        pin_memory=False,
+        persistent_workers=False,
+        to_rgb=True
+    )
+    model = VGGCustom(num_classes=3, in_channels=3)
+    trainer = Trainer(
+        model,
+        train_loader=train_loader,
+        val_loader=val_loader,
+        device=device,
+        lr=1e-4,
+        max_epochs=60,
+        plot_every=5,
+        class_weights=class_weights
+    )
+    trainer.train()
