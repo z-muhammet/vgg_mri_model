@@ -19,6 +19,17 @@ class SEBlock(nn.Module):
         y = self.excite(y).view(b, c, 1, 1)
         return x * y
 
+class TrainOnlyNoise(nn.Module):
+    def __init__(self, std: float = 0.05):
+        super().__init__()
+        self.std = std
+
+    def forward(self, x):
+        if self.training:
+            noise = torch.randn_like(x) * self.std
+            return x + noise
+        return x
+
 class ConvBlock(nn.Module):
     def __init__(self, in_ch: int, out_ch: int, *, stride: int = 1, use_se: bool = False):
         super().__init__()
@@ -45,41 +56,38 @@ class VGGCustom(nn.Module):
         self.blocks = nn.ModuleList([
             # Block 1: 4 Conv, sonuncusu stride=2 (downsampling)
             nn.Sequential(
-                ConvBlock(in_channels, 32, use_se=True),
-                ConvBlock(32, 64),
-                ConvBlock(64, 64),
-                ConvBlock(64, 128, stride=2),  # Downsampling
-                nn.Dropout2d(0.0),
+                ConvBlock(in_channels, 16),  # 32 -> 16 (0.6x)
+                ConvBlock(16, 32),                        # 64 -> 32 (0.6x)
+                ConvBlock(32, 65),                        # 64 -> 32 (0.6x)
+                TrainOnlyNoise(std=0.05),
+                nn.Dropout2d(0.15),
             ),
             # Block 2: 3 Conv, sonuncusu stride=2 (downsampling)
             nn.Sequential(
-                ConvBlock(128, 128),
-                ConvBlock(128, 128),
-                ConvBlock(128, 256, stride=2, use_se=True),  # Downsampling
-                nn.Dropout2d(0.0),
+                ConvBlock(65, 65),                     # 64 -> 65 (0.6x)
+                nn.MaxPool2d(kernel_size=2),# 128 -> 65 (0.6x)
+                ConvBlock(65,86),
+                ConvBlock(86, 129, use_se=True), # 256 -> 129 (0.6x)
+                nn.Dropout2d(0.25),
             ),
             # Block 3: 3 Conv, sonuncusu stride=2 (downsampling)
             nn.Sequential(
-                ConvBlock(256, 256),
-                ConvBlock(256, 256),
-                ConvBlock(256, 512, stride=2, use_se=True),  # Downsampling
-                nn.Dropout2d(0.0),
+                ConvBlock(129, 129),                      # 256 -> 129 (0.6x)
+                ConvBlock(129, 129),                      # 256 -> 129 (0.6x)
+                ConvBlock(129, 258, stride=2, use_se=True), # 512 -> 258 (0.6x)
+                nn.Dropout2d(0.3),
             ),
         ])
         self.avgpool = nn.AdaptiveAvgPool2d(1)
         self.classifier = nn.Sequential(
-            nn.Linear(512, 256),
-            nn.BatchNorm1d(256),
+            nn.Linear(258, 38),     # Son blok sonunda 258 kanal
+            nn.BatchNorm1d(38),
             nn.GELU(),
-            nn.Dropout(0.2),
-            nn.Linear(256, 128),
-            nn.BatchNorm1d(128),
-            nn.GELU(),
-            nn.Dropout(0.2),
-            nn.Linear(128, num_classes)
+            nn.Dropout(0.20),
+            nn.Linear(38, num_classes)
         )
         self._init_weights()
-        self.freeze_blocks_until(0)
+        self.freeze_blocks_until(0)  # Yalnızca ilk blok açık
     def _init_weights(self):
         for m in self.modules():
             if isinstance(m, nn.Conv2d):

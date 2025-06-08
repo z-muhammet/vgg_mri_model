@@ -2,11 +2,11 @@ import torch
 import numpy as np
 import random
 from models.vgg_custom import VGGCustom
-from dataset.custom_dataset import CustomTumorDataset
+from dataset.test import CustomTumorDataset
 import torchvision.transforms.v2 as T
 from torch.utils.data import DataLoader
 
-MODEL_PATH = "models/best_vgg_custom2.pt"
+MODEL_PATH = "models/best_vgg_custom.pt"
 TEST_PATH = "preprocessed_data/test"
 NUM_SAMPLES = 1000
 
@@ -25,8 +25,8 @@ transform = T.Compose([
     T.ToImage(),
     T.ToDtype(torch.float32, scale=True)
 ])
-dataset = CustomTumorDataset(TEST_PATH, transform=transform)
-class_names = dataset.classes
+dataset = CustomTumorDataset(TEST_PATH, transform=transform, to_rgb=True)
+class_names = dataset.class_names
 test_loader = DataLoader(dataset, batch_size=1, shuffle=True)
 
 # --- Tahmin ---
