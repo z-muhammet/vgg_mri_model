@@ -17,14 +17,13 @@ import torch.distributed as dist
 import torch.nn.functional as F
 import numpy as np
 from sklearn.metrics import confusion_matrix
-import gc  # Garbage collector için eklendi
+import gc
 from torch.optim.lr_scheduler import ReduceLROnPlateau, CosineAnnealingWarmRestarts
 from dataclasses import dataclass, field
 from typing import List, Tuple, Optional, Dict
 import math
 import platform
 
-# ANSI renk kodları
 RED = '\033[91m'
 GREEN = '\033[92m'
 YELLOW = '\033[93m'
@@ -34,30 +33,35 @@ MAGENTA = '\033[95m'
 RESET = '\033[0m'
 BOLD = '\033[1m'
 
+# Constants for Mixup Alpha Decay
+MIXUP_DECAY_START_EPOCH = 10
+MIXUP_DECAY_END_EPOCH = 50
+
 # Hyperparameters
-INITIAL_LR = 5e-4  # Learning rate düşürüldü (5e-2'den 5e-3'e)
-BATCH_SIZE = 8    # Batch size 8 olarak ayarlandı
+INITIAL_LR = 5e-4
+BATCH_SIZE = 8
 NUM_EPOCHS = 60
 WARMUP_EPOCHS = 3
 EARLY_STOPPING_PATIENCE = 10
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+GRADIENT_ACCUMULATION_STEPS = 2
 
 # Overfitting/Underfitting prevention parameters
-OVERFIT_THRESHOLD = 0.22  # Threshold düşürüldü (önceki 0.15'ti)
-MAX_OVERFIT_EPOCHS = 5    # Maximum epochs allowed for overfitting
-MAX_UNDERFIT_EPOCHS = 10   # Maximum epochs allowed for underfitting
-REGULARIZATION_FACTOR = 0.01  # Regularization azaltıldı (önceki 0.1'di)
-MAX_REGULARIZATION = 0.3   # Maximum regularization azaltıldı (önceki 0.5'ti)
-ROLLBACK_GAP_THRESH = 0.3    # |gap| ≥ %30 → rollback
-MAX_WEIGHT_DECAY  = 1e-2     # weight_decay için üst sınır
-PENALTY_FACTOR    = 1.5      # weight_decay × PENALTY_FACTOR
-ROLLBACK_ACC_THRESHOLD = 0.02  # 1.5% accuracy drop threshold
-ROLLBACK_LOSS_THRESHOLD = 0.04  # 4% loss increase threshold
-ROLLBACK_COOLDOWN = 3  # Minimum epochs between rollbacks
-MAX_TOTAL_ROLLBACKS = 10  # Maximum total rollbacks during training
-ROLLBACK_WINDOW = 20  # Window to check for rollback activity
-PENALTY_GAP_LOW   = 0.1      # |gap| ≥ %10
-PENALTY_GAP_HIGH  = 0.29     # |gap| <  %30
+OVERFIT_THRESHOLD = 0.22
+MAX_OVERFIT_EPOCHS = 5
+MAX_UNDERFIT_EPOCHS = 10
+REGULARIZATION_FACTOR = 0.01
+MAX_REGULARIZATION = 0.3
+ROLLBACK_GAP_THRESH = 0.3
+MAX_WEIGHT_DECAY  = 1e-2
+PENALTY_FACTOR    = 1.5
+ROLLBACK_ACC_THRESHOLD = 0.02
+ROLLBACK_LOSS_THRESHOLD = 0.04
+ROLLBACK_COOLDOWN = 3
+MAX_TOTAL_ROLLBACKS = 10
+ROLLBACK_WINDOW = 20
+PENALTY_GAP_LOW   = 0.1
+PENALTY_GAP_HIGH  = 0.29
 
 class DynamicRegularization(nn.Module):
     def __init__(self, model, initial_factor=0.1, max_factor=0.5):
@@ -87,7 +91,6 @@ class DynamicRegularization(nn.Module):
                 original_rate = self.original_dropout_rates[name]
                 module.p = min(original_rate * (1 + self.factor), 0.9)
 
-# ---------- Trainer State dataclass -------------------------------------------------------------
 @dataclass
 class TrainerState:
     best_acc: float = 0.0
@@ -97,10 +100,9 @@ class TrainerState:
     last_rb_epoch: int = 0
     total_rbs: int = 0
     cooldown: int = 0
-    no_imp_epochs: int = 0      # geliştirme: art arda iyileşme olmayan epoch sayısı
+    no_imp_epochs: int = 0
 
-# ---------- Trainer -----------------------------------------------------------------------------
-class Trainer(nn.Module): # Inherit from nn.Module for DynamicRegularization
+class Trainer(nn.Module):
     def __init__(
         self,
         model: nn.Module,
@@ -115,9 +117,9 @@ class Trainer(nn.Module): # Inherit from nn.Module for DynamicRegularization
         plot_every: int = 5,
         checkpoint_dir: str = "models",
         class_weights: torch.Tensor = None,
-        target_lr: float = 5e-3  # Eklenen parametre
+        target_lr: float = 5e-3
     ) -> None:
-        super().__init__() # Call super constructor
+        super().__init__()
         self.model = model.to(device)
         self.device = device
         self.train_loader = train_loader
@@ -128,40 +130,41 @@ class Trainer(nn.Module): # Inherit from nn.Module for DynamicRegularization
         self.plot_every = plot_every
         os.makedirs(checkpoint_dir, exist_ok=True)
         self.ckpt_path = os.path.join(checkpoint_dir, "best_vgg_custom.pt")
-        self.optim = torch.optim.AdamW(self.model.parameters(), lr=INITIAL_LR, weight_decay=1e-5)  # Düşük LR ile başlat
+        self.optim = torch.optim.AdamW(self.model.parameters(), lr=INITIAL_LR, weight_decay=1e-5)
         self.scheduler = ReduceLROnPlateau(
             self.optim,
             mode='min',
             factor=0.5,
             patience=5,
-            threshold=1e-2,        # %1'lik kayıp değişimini görmezden gel
-            threshold_mode='rel',  # 'rel' mutlak değil oransal değişim
+            threshold=1e-2,
+            threshold_mode='rel',
             cooldown=2,
             min_lr=1e-6
         )
-        self.last_lr = INITIAL_LR
-        self.criterion = nn.CrossEntropyLoss(weight=class_weights)
+        self.class_weights_cpu = class_weights.clone().detach().cpu()
+        self.criterion = nn.CrossEntropyLoss(weight=self.class_weights_cpu.to(self.device))
         self.amp_enabled = self.device.type == "cuda" and (hasattr(torch.cuda, "is_bf16_supported") and torch.cuda.is_bf16_supported())
         self.scaler = GradScaler(enabled=self.amp_enabled)
         self.regulariser = DynamicRegularization(self.model, initial_factor=REGULARIZATION_FACTOR)
         self.state = TrainerState()
-        self.hist: List[dict] = []  # for plotting
-        self.last_lr = INITIAL_LR
-        self.rollback_epochs: List[int] = [] # List to store epochs where rollback occurred
-        self.class_weights = class_weights
-        self.target_lr = target_lr  # Eklenen parametre
+        self.hist: List[dict] = []
+        self.rollback_epochs: List[int] = []
+        self.target_lr = target_lr
         self.mixup_alpha = 0.2
-        self.init_class_weights = class_weights.clone().detach().cpu()
+        self._mixup_initial_alpha = self.mixup_alpha
+        self._last_logged_mixup_alpha = -1.0
 
     def _run_epoch(self, train: bool = True) -> Tuple[float, float, torch.Tensor, torch.Tensor]:
         """
+        Runs a single training or validation epoch.
+
         Returns:
-        avg_loss         (float)
-        avg_acc          (float)
-        per_class_correct(torch.Tensor, shape=[num_classes])
-        per_class_total  (torch.Tensor, shape=[num_classes])
+        avg_loss (float): Average loss for the epoch.
+        avg_acc (float): Average accuracy for the epoch.
+        per_class_correct (torch.Tensor): Number of correct predictions per class.
+        per_class_total (torch.Tensor): Total samples per class.
         """
-        num_classes = len(self.class_weights)
+        num_classes = len(self.class_weights_cpu)
         per_class_correct = torch.zeros(num_classes, device=self.device)
         per_class_total   = torch.zeros(num_classes, device=self.device)
 
@@ -185,31 +188,34 @@ class Trainer(nn.Module): # Inherit from nn.Module for DynamicRegularization
                     with autocast(device_type=self.device.type, enabled=self.amp_enabled):
                         out  = self.model(X)
                         loss = lam * self.criterion(out, y_a) + (1 - lam) * self.criterion(out, y_b)
+                    
+                    # Gradient accumulation
+                    self.scaler.scale(loss / GRADIENT_ACCUMULATION_STEPS).backward()
+                    
+                    # Perform optimizer step
+                    if (i + 1) % GRADIENT_ACCUMULATION_STEPS == 0 or (i + 1) == len(loader):
+                        self.scaler.step(self.optim)
+                        self.scaler.update()
+                        self.optim.zero_grad(set_to_none=True)
                 else:
                     with autocast(device_type=self.device.type, enabled=self.amp_enabled):
                         out  = self.model(X)
                         loss = self.criterion(out, y)
 
-                if train:
-                    self.scaler.scale(loss).backward()
-                    self.scaler.step(self.optim)
-                    self.scaler.update()
-                    self.optim.zero_grad(set_to_none=True)
-
-                # Batch metrikleri
+                # Batch metrics
                 batch_size = y.size(0)
                 tot_loss  += loss.item() * batch_size
                 preds      = out.argmax(dim=1)
                 correct   += (preds == y).sum().item()
                 total     += batch_size
 
-                # Sınıf bazlı sayaçlar
+                # Per-class counters
                 for cls in range(num_classes):
                     mask = (y == cls)
                     per_class_correct[cls] += (preds[mask] == cls).sum().item()
                     per_class_total[cls]   += mask.sum().item()
 
-                # Temizlik
+                # Cleanup
                 del X, y, out, loss
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
@@ -224,31 +230,26 @@ class Trainer(nn.Module): # Inherit from nn.Module for DynamicRegularization
         cfg_loss_rise = 0.04
         cooldown_epochs = 3
 
-        # Need at least 1 previous epoch in history to compare against.
-        # _log_epoch adds the *current* epoch's state after this is called.
-        # So if len(self.hist) == 0, there's no previous epoch to compare to.
         if len(self.hist) < 1:
             return
 
-        # Get the state and metrics of the previous epoch (the last one logged).
         prev_state = self.hist[-1]
 
-        # Compare current epoch's performance (val_acc, val_loss) with the previous epoch's metrics (prev_state)
+        # Compare current epoch's performance with previous epoch's metrics
         acc_drop = (prev_state["val_acc"] - val_acc) / (prev_state["val_acc"] + 1e-8)
         loss_rise = (val_loss - prev_state["val_loss"]) / (prev_state["val_loss"] + 1e-8)
 
-        # Check if rollback conditions are met and if the previous state has weights (should always if logging successful)
+        # Check if rollback conditions are met
         if (
             acc_drop >= cfg_acc_drop or loss_rise >= cfg_loss_rise
-        ) and self.state.cooldown == 0 and self.state.total_rbs < MAX_TOTAL_ROLLBACKS and "weights" in prev_state: # Check prev_state for 'weights'
-            print(f"\n{YELLOW}[Rollback] Triggered! Δacc={acc_drop:.3f}, Δloss={loss_rise:.3f} → restoring previous weights (epoch {prev_state['epoch']}){RESET}") # Use epoch from prev_state
+        ) and self.state.cooldown == 0 and self.state.total_rbs < MAX_TOTAL_ROLLBACKS and "weights" in prev_state:
+            print(f"\n{YELLOW}[Rollback] Triggered! Δacc={acc_drop:.3f}, Δloss={loss_rise:.3f} → restoring previous weights (epoch {prev_state['epoch']}){RESET}")
             try:
                 # Load the state dicts from the previous epoch
                 if "weights" in prev_state and "optim_state" in prev_state:
                     self.model.load_state_dict(prev_state["weights"])
                     self.optim.load_state_dict(prev_state["optim_state"])
                     self.state.total_rbs += 1
-                    # Update last_rb_epoch to the epoch we rolled back to
                     self.state.last_rb_epoch = prev_state['epoch']
                     self.state.cooldown = cooldown_epochs
                     print(f"{YELLOW}[Rollback] Total rollbacks: {self.state.total_rbs}, Cooldown: {self.state.cooldown} epochs\n{RESET}")
@@ -256,52 +257,35 @@ class Trainer(nn.Module): # Inherit from nn.Module for DynamicRegularization
                     print(f"{RED}[Rollback Error] Previous epoch state in history does not contain 'weights' or 'optim_state' keys. Cannot rollback for epoch {prev_state['epoch']}.{RESET}")
             except Exception as e:
                  print(f"{RED}[Rollback Error] Could not load state dicts for epoch {prev_state['epoch']}: {e}{RESET}")
-                 # If rollback fails, perhaps we should stop or handle differently.
-                 # For now, just log the error and continue.
-            # Log the current epoch number where the rollback was triggered
             self.rollback_epochs.append(self.state.epoch)
-
 
     def _maybe_open_block(self, val_acc: float, val_loss: float):
         opened = self.model.opened_blocks
-        # Can only open blocks up to the total number of blocks - 1 (since opened_blocks is 0-indexed for next block)
         if opened >= len(self.model.blocks):
             return
 
-        # Prevent opening the 2nd block if total rollbacks are less than 3 or no improvements in the last 5 epochs
-        if opened == 1 and self.state.no_imp_epochs <= 5:
+        # Prevent opening Block 2 if rollbacks are insufficient or no improvements
+        if opened == 1 and self.state.no_imp_epochs <= 2:
             print(f"{YELLOW}[Block] Skipping opening Block-2 at epoch {self.state.epoch} - insufficient rollbacks ({self.state.total_rbs}) or improvements ({self.state.no_imp_epochs}){RESET}")
             return
 
-        # Prevent opening the 3rd block if total rollbacks haven't reached the maximum
+        # Prevent opening Block 3 if total rollbacks haven't reached the maximum
         if opened == 2 and self.state.total_rbs < MAX_TOTAL_ROLLBACKS:
-             # print(f"{YELLOW}[Block] Skipping opening Block-3 at epoch {self.state.epoch} - max rollbacks not reached ({self.state.total_rbs}/{MAX_TOTAL_ROLLBACKS}){RESET}")
              return
 
-        # Stagnation check: if validation loss has not improved significantly in the last few epochs
-        # Use a window size that makes sense, e.g., half the rollback window or at least 2 epochs.
+        # Check for stagnation: if validation loss has not improved significantly in recent epochs
         stagnation_window = max(2, min(len(self.hist), ROLLBACK_WINDOW // 2))
-        # We need enough history entries to check for stagnation over the window
         if len(self.hist) < stagnation_window:
             return
 
-        # Check if val loss in the last 'stagnation_window' epochs is mostly >= current val_loss
-        # Access history from the end: hist[-1] is most recent, hist[-stagnation_window] is the oldest in the window
         stagnant = all(h["val_loss"] >= val_loss for h in self.hist[-stagnation_window:])
 
-        # Check if block opening conditions are met
-        # Open the next block if training is stagnant or validation accuracy is high and we haven't opened all blocks
-        # opened_blocks is the count of already opened blocks, which is the index of the NEXT block to open
-        if (stagnant or val_acc > 0.75) and opened < len(self.model.blocks):
-             # Open the block at index 'opened'
-             self.model.freeze_blocks_until(opened) # freeze_blocks_until expects the index of the last block to keep open (inclusive), so passing 'opened' opens block 'opened'
-             # The freeze_blocks_until method should handle the internal opened_blocks count update
-             # Print the index of the block that was just opened (which is 'opened' + 1 if 1-indexed, or just 'self.model.opened_blocks' after the call)
+        # Open the next block if training is stagnant or validation accuracy is high
+        if (stagnant or val_acc > 0.55) and opened < len(self.model.blocks):
+             self.model.freeze_blocks_until(opened)
              print(f"{CYAN}[Block] Block-{self.model.opened_blocks} opened at epoch {self.state.epoch} (val_acc={val_acc:.3f}, val_loss={val_loss:.3f}){RESET}")
 
-
     def _log_epoch(self, tr_acc, tr_loss, val_acc, val_loss):
-        # Create current epoch's history entry
         cur = {
             "epoch": self.state.epoch,
             "train_acc": tr_acc,
@@ -311,27 +295,33 @@ class Trainer(nn.Module): # Inherit from nn.Module for DynamicRegularization
             "lr": self.optim.param_groups[0]["lr"],
         }
 
-        # Save model and optimizer state for rollback *at the end* of the current epoch.
-        # These states correspond to the model's parameters after completing the current epoch's training/validation.
-        # They will be used to revert *to* this state if a future epoch performs poorly.
+        # Save model and optimizer state for rollback
         try:
-            cur["weights"] = copy.deepcopy(self.model.state_dict())
-            cur["optim_state"] = copy.deepcopy(self.optim.state_dict())
+            # Move model parameters to CPU and copy
+            with torch.no_grad():
+                cpu_weights = {k: v.detach().cpu() for k, v in self.model.state_dict().items()}
+            cur["weights"] = cpu_weights
+            # Move optimizer state tensors to CPU
+            optim_cpu = {}
+            for k, v in self.optim.state_dict().items():
+                if isinstance(v, dict):
+                    optim_cpu[k] = {
+                        sk: sv.detach().cpu() if torch.is_tensor(sv) else sv
+                        for sk, sv in v.items()
+                    }
+                else:
+                    optim_cpu[k] = v
+            cur["optim_state"] = optim_cpu
         except Exception as e:
             print(f"{RED}[Log Epoch Error] Could not deepcopy state dicts for epoch {self.state.epoch}: {e}{RESET}")
-            # If deepcopy fails, we cannot save the state for this epoch for rollback.
-            # This epoch cannot be a target for rollback.
 
         self.hist.append(cur)
 
-        # Ensure history does not grow indefinitely and keeps recent states for rollback
-        # Keep history size limited. We need enough history for rollback comparisons (ROLLBACK_WINDOW) + 1 for the current epoch state.
-        # Let's keep a small buffer, e.g., ROLLBACK_WINDOW + 2.
+        # Ensure history does not grow indefinitely
         while len(self.hist) > ROLLBACK_WINDOW + 2:
             self.hist.pop(0)
-            gc.collect()  # Ekstra: GPU belleğini temizle
+            gc.collect()
 
-    
     def train(self):
         min_lr, max_lr = 5e-6, 1e-2
         lr_factor_down = 0.85
@@ -345,67 +335,72 @@ class Trainer(nn.Module): # Inherit from nn.Module for DynamicRegularization
             for pg in optimizer.param_groups:
                 pg['lr'] = new_lr
 
-        num_classes = len(self.class_weights)
+        num_classes = len(self.class_weights_cpu)
 
         for epoch in range(1, self.max_epochs + 1):
             self.state.epoch = epoch
             t0 = time.time()
 
-            # Her epoch başında CB-weights'ı sıfırla
-            self.class_weights = self.init_class_weights.clone().to(self.device)
-
-            # Warm-up LR
+            # Warm-up LR adjustment
             if epoch <= WARMUP_EPOCHS:
                 warmup_lr = INITIAL_LR + (self.target_lr - INITIAL_LR) * (epoch / WARMUP_EPOCHS)
                 for pg in self.optim.param_groups:
                     pg['lr'] = warmup_lr
                 print(f"{YELLOW}[Warmup] LR set to {warmup_lr:.2e} (epoch {epoch}){RESET}")
 
-            # 1) Eğitim ve validasyon epoch'ları
+            # Run training and validation epochs
             tr_loss, tr_acc, tr_corr_tr, tr_tot_tr = self._run_epoch(train=True)
             val_loss, val_acc, val_corr_val, val_tot_val = self._run_epoch(train=False)
 
-            # Warm-up sonrası scheduler ve LR ayarlamaları
+            # Scheduler and LR adjustments after warm-up
             if epoch > WARMUP_EPOCHS:
                 self.scheduler.step(val_loss)
 
-                # 3) LR değişimi log'u
-                current_lr = self.optim.param_groups[0]['lr']
-                if abs(current_lr - self.last_lr) > 1e-8:
-                    print(f"{YELLOW}[LR Scheduler] LR changed: {self.last_lr:.2e} → {current_lr:.2e} (epoch {epoch}){RESET}")
-                    self.last_lr = current_lr
+                # Gradually reduce Mixup alpha every 10 epochs
+                if epoch > MIXUP_DECAY_START_EPOCH:
+                    num_decay_intervals = (epoch - MIXUP_DECAY_START_EPOCH) // 10
+                    decay_per_interval = self._mixup_initial_alpha / ((MIXUP_DECAY_END_EPOCH - MIXUP_DECAY_START_EPOCH) / 10)
+                    new_mixup_alpha = self._mixup_initial_alpha - (num_decay_intervals * decay_per_interval)
+                    self.mixup_alpha = max(0.0, new_mixup_alpha)
+                    if self.mixup_alpha != self._last_logged_mixup_alpha:
+                        print(f"{YELLOW}[Mixup] Mixup alpha reduced to {self.mixup_alpha:.2f} at epoch {epoch}{RESET}")
+                        self._last_logged_mixup_alpha = self.mixup_alpha
 
-                # 4) Cooldown'u indir
+                # Log LR changes
+                current_lr = self.optim.param_groups[0]['lr']
+                if abs(current_lr - self.optim.param_groups[0]['lr']) > 1e-8:
+                    print(f"{YELLOW}[LR Scheduler] LR changed: {self.optim.param_groups[0]['lr']:.2e} → {current_lr:.2e} (epoch {epoch}){RESET}")
+
+                # Decrease cooldown counter
                 if self.state.cooldown > 0:
                     self.state.cooldown -= 1
 
-                # 5) Gap hesapla
+                # Calculate gap
                 gap     = tr_acc - val_acc
                 gap_abs = abs(gap)
 
                 if gap_abs >= ROLLBACK_GAP_THRESH:
-                    # Büyük gap → rollback
                     self._maybe_rollback(val_acc, val_loss)
 
                 else:
-                    # Orta şiddette gap → sınıf bazlı ağırlık güncellemesi (ClassPenalty)
+                    # Class-based weight update (ClassPenalty) for moderate gap
                     if PENALTY_GAP_LOW <= gap_abs < PENALTY_GAP_HIGH:
                         train_acc_cls = tr_corr_tr / (tr_tot_tr + 1e-8)
                         val_acc_cls   = val_corr_val / (val_tot_val + 1e-8)
-                        per_class_gap = train_acc_cls - val_acc_cls  # tensor
+                        per_class_gap = train_acc_cls - val_acc_cls
                         for cls, g in enumerate(per_class_gap.cpu()):
                             if g > PENALTY_GAP_LOW:
-                                self.class_weights[cls] *= 0.97
-                        # Normalize: toplam = num_classes
-                        self.class_weights = self.class_weights / self.class_weights.sum() * len(self.class_weights)
-                        self.criterion.weight = self.class_weights
+                                self.class_weights_cpu[cls] *= 0.97
+                        self.class_weights_cpu = self.class_weights_cpu / self.class_weights_cpu.sum() * len(self.class_weights_cpu)
+                        with torch.no_grad():
+                            self.criterion.weight.data.copy_(self.class_weights_cpu.to(self.device))
                         print(f"{YELLOW}[ClassPenalty] per_class_gap: {per_class_gap.cpu().numpy()}")
-                        print(f"{YELLOW}[ClassPenalty] new weights: {self.class_weights.cpu().numpy()}{RESET}")
+                        print(f"{YELLOW}[ClassPenalty] new weights: {self.class_weights_cpu.cpu().numpy()}{RESET}")
 
-                # 6) Blok açmayı dene
+                # Attempt to open block
                 self._maybe_open_block(val_acc, val_loss)
 
-                # 7) Over/underfit için regularisation
+                # Regularization for over/underfitting
                 if gap > self.overfit_thr:
                     self.regulariser.increase_regularization()
                     print(f"{YELLOW}[Regulariser] Overfit detected (gap={gap:.3f}), regularisation increased to {self.regulariser.factor:.2f}{RESET}")
@@ -413,7 +408,7 @@ class Trainer(nn.Module): # Inherit from nn.Module for DynamicRegularization
                     self.regulariser.decrease_regularization()
                     print(f"{YELLOW}[Regulariser] Underfit detected (val_acc={val_acc:.3f}), regularisation decreased to {self.regulariser.factor:.2f}{RESET}")
 
-                # 8) Cooldown sırasında LR ayarla
+                # Adjust LR during cooldown
                 if self.state.cooldown > 0:
                     if gap > self.overfit_thr:
                         new_lr = max(self.optim.param_groups[0]['lr'] * lr_factor_down, min_lr)
@@ -428,10 +423,9 @@ class Trainer(nn.Module): # Inherit from nn.Module for DynamicRegularization
                             self.scheduler.num_bad_epochs = 0
                             print(f"{YELLOW}[LR Adjust] Underfit: LR increased to {new_lr:.2e}{RESET}")
 
-            # 9) Epoch log ve checkpoint
+            # Epoch log and checkpoint
             self._log_epoch(tr_acc, tr_loss, val_acc, val_loss)
             if val_acc > self.state.best_acc:
-                # iyileşme oldu → sayaç sıfırla
                 self.state.best_acc = val_acc
                 self.state.best_loss = val_loss
                 self.state.best_weights = self.hist[-1]["weights"]
@@ -442,7 +436,7 @@ class Trainer(nn.Module): # Inherit from nn.Module for DynamicRegularization
             else:
                 self.state.no_imp_epochs += 1
 
-            # 10) Özet bas
+            # Summarize epoch results
             dt = time.time() - t0
             block_info = f"{self.model.opened_blocks}/{len(self.model.blocks)}"
             print(
@@ -458,14 +452,14 @@ class Trainer(nn.Module): # Inherit from nn.Module for DynamicRegularization
             )
             print(f"{CYAN}[TrainerState]{RESET} epoch={epoch}, best_acc={self.state.best_acc:.3f}, total_rbs={self.state.total_rbs}, cooldown={self.state.cooldown}, no_imp_epochs={self.state.no_imp_epochs}")
 
-            # 11) Plot ve erken durdurma
+            # Plot history and early stopping check
             if epoch % self.plot_every == 0 or epoch == self.max_epochs:
                 self._plot_history()
             if val_acc >= 0.958:
                 print(f"{GREEN}Target accuracy reached – stopping early.{RESET}")
                 break
 
-            # 12) Cache temizliği ve bellek raporu
+            # Clear cache and report memory
             torch.cuda.empty_cache()
             gc.collect()
 
@@ -498,7 +492,6 @@ class Trainer(nn.Module): # Inherit from nn.Module for DynamicRegularization
         plt.close()
 
 def get_class_balanced_weights(labels, beta=0.99):
-    # labels: torch.Tensor (N,)
     counts = torch.bincount(labels)
     effective_num = 1.0 - torch.pow(beta, counts.float())
     weights = (1.0 - beta) / (effective_num + 1e-8)
@@ -506,7 +499,7 @@ def get_class_balanced_weights(labels, beta=0.99):
     return weights
 
 def mixup_data(x, y, alpha=0.2):
-    '''Returns mixed inputs, pairs of targets, and lambda'''
+    """Returns mixed inputs, pairs of targets, and lambda"""
     if alpha > 0:
         lam = np.random.beta(alpha, alpha)
     else:
@@ -522,14 +515,6 @@ def build_dataloaders(batch_size=8, num_workers=2, to_rgb=False, pin_memory=True
     if platform.system() == "Windows":
         num_workers = 0
         persistent_workers = False
-    #aug = T.Compose([
-    #    T.RandomAffine(degrees=3, translate=(0.01, 0.01), scale=(0.97, 1.03), shear=1, fill=0),
-    #    T.RandomResizedCrop(224, scale=(0.95, 1.0), ratio=(0.97, 1.03)),
-    #    T.RandomHorizontalFlip(p=0.05),
-        T.RandomErasing(p=0.05, scale=(0.005, 0.05)),
-        T.GaussianBlur(kernel_size=3, sigma=(0.05, 0.3)),
-    #])
-    
     aug = None
     train_ds = CustomTumorDataset("preprocessed_data/train", to_rgb=to_rgb, transform=aug)
     val_ds = CustomTumorDataset("preprocessed_data/val", to_rgb=to_rgb)
@@ -541,7 +526,6 @@ def build_dataloaders(batch_size=8, num_workers=2, to_rgb=False, pin_memory=True
         val_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers,
         pin_memory=pin_memory, persistent_workers=persistent_workers
     )
-    # Class weights elle başlat
     cb_weights = torch.tensor([1.06, 0.9, 1.04], dtype=torch.float32)
     cb_weights = cb_weights.to(torch.device('cuda' if torch.cuda.is_available() else 'cpu'))
     return train_loader, val_loader, cb_weights
