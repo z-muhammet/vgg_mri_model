@@ -53,37 +53,41 @@ class ConvBlock(nn.Module):
 class VGGCustom(nn.Module):
     def __init__(self, num_classes: int = 3, in_channels: int = 3):
         super().__init__()
+        self.block_out_channels = [64, 128, 258]  # Her bloğun çıkış kanal sayısı
         self.blocks = nn.ModuleList([
             # Block 1: 4 Conv, sonuncusu stride=2 (downsampling)
             nn.Sequential(
-                ConvBlock(in_channels, 16),  # 32 -> 16 (0.6x)
-                ConvBlock(16, 32),                        # 64 -> 32 (0.6x)
-                ConvBlock(32, 65),                        # 64 -> 32 (0.6x)
-                TrainOnlyNoise(std=0.05),
-                nn.Dropout2d(0.15),
+                ConvBlock(in_channels, 32),   # 3→32
+                ConvBlock(32, 64),            # 32→64
+                nn.MaxPool2d(kernel_size=2),  # spatial ↓
+                nn.Dropout2d(0.05),
             ),
             # Block 2: 3 Conv, sonuncusu stride=2 (downsampling)
             nn.Sequential(
-                ConvBlock(65, 65),                     # 64 -> 65 (0.6x)
-                nn.MaxPool2d(kernel_size=2),# 128 -> 65 (0.6x)
-                ConvBlock(65,86),
-                ConvBlock(86, 129, use_se=True), # 256 -> 129 (0.6x)
-                nn.Dropout2d(0.25),
+                ConvBlock(64, 64),            # 64→64
+                ConvBlock(64, 128, use_se=True),  # 64→128
+                ConvBlock(128, 128),              # 128→128
+                nn.Dropout2d(0.15),
             ),
             # Block 3: 3 Conv, sonuncusu stride=2 (downsampling)
             nn.Sequential(
-                ConvBlock(129, 129),                      # 256 -> 129 (0.6x)
-                ConvBlock(129, 129),                      # 256 -> 129 (0.6x)
-                ConvBlock(129, 258, stride=2, use_se=True), # 512 -> 258 (0.6x)
+                ConvBlock(128, 128),              # 128→128
+                ConvBlock(128, 128),              # 128→128
+                ConvBlock(128, 258, stride=2, use_se=True), # 128→258
                 nn.Dropout2d(0.3),
             ),
         ])
         self.avgpool = nn.AdaptiveAvgPool2d(1)
+        # Adaptörler: her blok çıkışından 258'e
+        self.adaptors = nn.ModuleList([
+            nn.Identity(),  # 258 ise gerek yok
+            nn.Linear(64, 258),   # 64→258
+            nn.Linear(128, 258),  # 128→258
+        ])
         self.classifier = nn.Sequential(
             nn.Linear(258, 38),     # Son blok sonunda 258 kanal
             nn.BatchNorm1d(38),
-            nn.GELU(),
-            nn.Dropout(0.20),
+            nn.SiLU(),
             nn.Linear(38, num_classes)
         )
         self._init_weights()
@@ -109,9 +113,18 @@ class VGGCustom(nn.Module):
                 p.requires_grad = req_grad
         self.opened_blocks = last_open_idx + 1
     def forward(self, x):
-        for blk in self.blocks:
-            x = blk(x)
-        # Pool to 1x1 to reduce memory usage
+        last_block_idx = -1
+        for i, blk in enumerate(self.blocks):
+            if i < self.opened_blocks:
+                x = blk(x)
+                last_block_idx = i
         x = self.avgpool(x)
         x = x.view(x.size(0), -1)
+        # Adaptör ile 258 kanala çek
+        if last_block_idx == 2:
+            x = self.adaptors[0](x)  # 258→258 (Identity)
+        elif last_block_idx == 1:
+            x = self.adaptors[2](x)  # 128→258
+        elif last_block_idx == 0:
+            x = self.adaptors[1](x)  # 64→258
         return self.classifier(x)

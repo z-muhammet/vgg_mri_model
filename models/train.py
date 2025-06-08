@@ -34,24 +34,6 @@ MAGENTA = '\033[95m'
 RESET = '\033[0m'
 BOLD = '\033[1m'
 
-class FocalLoss(torch.nn.Module):
-    def __init__(self, alpha=None, gamma=2, reduction='mean'):
-        super(FocalLoss, self).__init__()
-        self.alpha = alpha
-        self.gamma = gamma
-        self.reduction = reduction
-
-    def forward(self, inputs, targets):
-        ce_loss = F.cross_entropy(inputs, targets, weight=self.alpha, reduction='none')
-        pt = torch.exp(-ce_loss)
-        focal_loss = ((1 - pt) ** self.gamma) * ce_loss
-        if self.reduction == 'mean':
-            return focal_loss.mean()
-        elif self.reduction == 'sum':
-            return focal_loss.sum()
-        else:
-            return focal_loss
-
 # Hyperparameters
 INITIAL_LR = 5e-4  # Learning rate düşürüldü (5e-2'den 5e-3'e)
 BATCH_SIZE = 8    # Batch size 8 olarak ayarlandı
@@ -60,42 +42,22 @@ WARMUP_EPOCHS = 3
 EARLY_STOPPING_PATIENCE = 10
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-# Class weight parameters
-lambda_penalty = 0.01  # Penalty artırıldı
-min_weight = 0.8
-
 # Overfitting/Underfitting prevention parameters
-# Overfitting durumunu tespit etmek için kullanılan eşik değeri
-# Eğer validation loss ile training loss arasındaki fark bu değerden büyükse overfitting olarak kabul edilir
 OVERFIT_THRESHOLD = 0.22  # Threshold düşürüldü (önceki 0.15'ti)
-# Overfitting durumunda izin verilen maksimum epoch sayısı
-# Bu sayıya ulaşılırsa eğitim durdurulur
 MAX_OVERFIT_EPOCHS = 5    # Maximum epochs allowed for overfitting
-
-# Underfitting durumunda izin verilen maksimum epoch sayısı
-# Bu sayıya ulaşılırsa eğitim durdurulur
 MAX_UNDERFIT_EPOCHS = 10   # Maximum epochs allowed for underfitting
-
-# Regularization için başlangıç faktörü
-# Dropout ve weight decay gibi regularization tekniklerinin şiddetini belirler
 REGULARIZATION_FACTOR = 0.01  # Regularization azaltıldı (önceki 0.1'di)
-
-# Regularization için izin verilen maksimum değer
-# Regularization faktörü bu değeri geçemez
 MAX_REGULARIZATION = 0.3   # Maximum regularization azaltıldı (önceki 0.5'ti)
-
 ROLLBACK_GAP_THRESH = 0.3    # |gap| ≥ %30 → rollback
-PENALTY_GAP_LOW   = 0.1      # |gap| ≥ %10
-PENALTY_GAP_HIGH  = 0.29      # |gap| <  %20
 MAX_WEIGHT_DECAY  = 1e-2     # weight_decay için üst sınır
 PENALTY_FACTOR    = 1.5      # weight_decay × PENALTY_FACTOR
-
-# Rollback parameters
 ROLLBACK_ACC_THRESHOLD = 0.02  # 1.5% accuracy drop threshold
 ROLLBACK_LOSS_THRESHOLD = 0.04  # 4% loss increase threshold
 ROLLBACK_COOLDOWN = 3  # Minimum epochs between rollbacks
 MAX_TOTAL_ROLLBACKS = 10  # Maximum total rollbacks during training
 ROLLBACK_WINDOW = 20  # Window to check for rollback activity
+PENALTY_GAP_LOW   = 0.1      # |gap| ≥ %10
+PENALTY_GAP_HIGH  = 0.29     # |gap| <  %30
 
 class DynamicRegularization(nn.Module):
     def __init__(self, model, initial_factor=0.1, max_factor=0.5):
@@ -188,6 +150,8 @@ class Trainer(nn.Module): # Inherit from nn.Module for DynamicRegularization
         self.rollback_epochs: List[int] = [] # List to store epochs where rollback occurred
         self.class_weights = class_weights
         self.target_lr = target_lr  # Eklenen parametre
+        self.mixup_alpha = 0.2
+        self.init_class_weights = class_weights.clone().detach().cpu()
 
     def _run_epoch(self, train: bool = True) -> Tuple[float, float, torch.Tensor, torch.Tensor]:
         """
@@ -216,9 +180,15 @@ class Trainer(nn.Module): # Inherit from nn.Module for DynamicRegularization
                 y = y.long().to(self.device, non_blocking=True)
                 X = X.to(self.device, non_blocking=True)
 
-                with autocast(device_type=self.device.type, enabled=self.amp_enabled):
-                    out  = self.model(X)
-                    loss = self.criterion(out, y)
+                if train:
+                    X, y_a, y_b, lam = mixup_data(X, y, alpha=self.mixup_alpha)
+                    with autocast(device_type=self.device.type, enabled=self.amp_enabled):
+                        out  = self.model(X)
+                        loss = lam * self.criterion(out, y_a) + (1 - lam) * self.criterion(out, y_b)
+                else:
+                    with autocast(device_type=self.device.type, enabled=self.amp_enabled):
+                        out  = self.model(X)
+                        loss = self.criterion(out, y)
 
                 if train:
                     self.scaler.scale(loss).backward()
@@ -299,7 +269,7 @@ class Trainer(nn.Module): # Inherit from nn.Module for DynamicRegularization
             return
 
         # Prevent opening the 2nd block if total rollbacks are less than 3 or no improvements in the last 5 epochs
-        if opened == 1 and (self.state.total_rbs < 3 or self.state.no_imp_epochs <= 5):
+        if opened == 1 and self.state.no_imp_epochs <= 5:
             print(f"{YELLOW}[Block] Skipping opening Block-2 at epoch {self.state.epoch} - insufficient rollbacks ({self.state.total_rbs}) or improvements ({self.state.no_imp_epochs}){RESET}")
             return
 
@@ -322,7 +292,7 @@ class Trainer(nn.Module): # Inherit from nn.Module for DynamicRegularization
         # Check if block opening conditions are met
         # Open the next block if training is stagnant or validation accuracy is high and we haven't opened all blocks
         # opened_blocks is the count of already opened blocks, which is the index of the NEXT block to open
-        if (stagnant or val_acc > 0.85) and opened < len(self.model.blocks):
+        if (stagnant or val_acc > 0.75) and opened < len(self.model.blocks):
              # Open the block at index 'opened'
              self.model.freeze_blocks_until(opened) # freeze_blocks_until expects the index of the last block to keep open (inclusive), so passing 'opened' opens block 'opened'
              # The freeze_blocks_until method should handle the internal opened_blocks count update
@@ -381,6 +351,9 @@ class Trainer(nn.Module): # Inherit from nn.Module for DynamicRegularization
             self.state.epoch = epoch
             t0 = time.time()
 
+            # Her epoch başında CB-weights'ı sıfırla
+            self.class_weights = self.init_class_weights.clone().to(self.device)
+
             # Warm-up LR
             if epoch <= WARMUP_EPOCHS:
                 warmup_lr = INITIAL_LR + (self.target_lr - INITIAL_LR) * (epoch / WARMUP_EPOCHS)
@@ -415,50 +388,45 @@ class Trainer(nn.Module): # Inherit from nn.Module for DynamicRegularization
                     self._maybe_rollback(val_acc, val_loss)
 
                 else:
-                    # Orta şiddette gap → sınıf bazlı ağırlık güncellemesi
+                    # Orta şiddette gap → sınıf bazlı ağırlık güncellemesi (ClassPenalty)
                     if PENALTY_GAP_LOW <= gap_abs < PENALTY_GAP_HIGH:
-                        # Sınıf bazlı doğruluk farkı
                         train_acc_cls = tr_corr_tr / (tr_tot_tr + 1e-8)
                         val_acc_cls   = val_corr_val / (val_tot_val + 1e-8)
                         per_class_gap = train_acc_cls - val_acc_cls  # tensor
-
-                        # Eşiği geçen sınıfların ağırlığını %20 azalt
                         for cls, g in enumerate(per_class_gap.cpu()):
                             if g > PENALTY_GAP_LOW:
                                 self.class_weights[cls] *= 0.97
-
                         # Normalize: toplam = num_classes
-                        self.class_weights = self.class_weights / self.class_weights.sum() * num_classes
-                        self.criterion.weight = self.class_weights.to(self.device)
-
+                        self.class_weights = self.class_weights / self.class_weights.sum() * len(self.class_weights)
+                        self.criterion.weight = self.class_weights
                         print(f"{YELLOW}[ClassPenalty] per_class_gap: {per_class_gap.cpu().numpy()}")
                         print(f"{YELLOW}[ClassPenalty] new weights: {self.class_weights.cpu().numpy()}{RESET}")
 
-                    # 6) Blok açmayı dene
-                    self._maybe_open_block(val_acc, val_loss)
+                # 6) Blok açmayı dene
+                self._maybe_open_block(val_acc, val_loss)
 
-                    # 7) Over/underfit için regularisation
+                # 7) Over/underfit için regularisation
+                if gap > self.overfit_thr:
+                    self.regulariser.increase_regularization()
+                    print(f"{YELLOW}[Regulariser] Overfit detected (gap={gap:.3f}), regularisation increased to {self.regulariser.factor:.2f}{RESET}")
+                elif val_acc < self.underfit_thr:
+                    self.regulariser.decrease_regularization()
+                    print(f"{YELLOW}[Regulariser] Underfit detected (val_acc={val_acc:.3f}), regularisation decreased to {self.regulariser.factor:.2f}{RESET}")
+
+                # 8) Cooldown sırasında LR ayarla
+                if self.state.cooldown > 0:
                     if gap > self.overfit_thr:
-                        self.regulariser.increase_regularization()
-                        print(f"{YELLOW}[Regulariser] Overfit detected (gap={gap:.3f}), regularisation increased to {self.regulariser.factor:.2f}{RESET}")
+                        new_lr = max(self.optim.param_groups[0]['lr'] * lr_factor_down, min_lr)
+                        if new_lr < self.optim.param_groups[0]['lr'] - 1e-8:
+                            adjust_learning_rate(self.optim, new_lr)
+                            self.scheduler.num_bad_epochs = 0
+                            print(f"{YELLOW}[LR Adjust] Overfit: LR decreased to {new_lr:.2e}{RESET}")
                     elif val_acc < self.underfit_thr:
-                        self.regulariser.decrease_regularization()
-                        print(f"{YELLOW}[Regulariser] Underfit detected (val_acc={val_acc:.3f}), regularisation decreased to {self.regulariser.factor:.2f}{RESET}")
-
-                    # 8) Cooldown sırasında LR ayarla
-                    if self.state.cooldown > 0:
-                        if gap > self.overfit_thr:
-                            new_lr = max(self.optim.param_groups[0]['lr'] * lr_factor_down, min_lr)
-                            if new_lr < self.optim.param_groups[0]['lr'] - 1e-8:
-                                adjust_learning_rate(self.optim, new_lr)
-                                self.scheduler.num_bad_epochs = 0
-                                print(f"{YELLOW}[LR Adjust] Overfit: LR decreased to {new_lr:.2e}{RESET}")
-                        elif val_acc < self.underfit_thr:
-                            new_lr = min(self.optim.param_groups[0]['lr'] * lr_factor_up, max_lr)
-                            if new_lr > self.optim.param_groups[0]['lr'] + 1e-8:
-                                adjust_learning_rate(self.optim, new_lr)
-                                self.scheduler.num_bad_epochs = 0
-                                print(f"{YELLOW}[LR Adjust] Underfit: LR increased to {new_lr:.2e}{RESET}")
+                        new_lr = min(self.optim.param_groups[0]['lr'] * lr_factor_up, max_lr)
+                        if new_lr > self.optim.param_groups[0]['lr'] + 1e-8:
+                            adjust_learning_rate(self.optim, new_lr)
+                            self.scheduler.num_bad_epochs = 0
+                            print(f"{YELLOW}[LR Adjust] Underfit: LR increased to {new_lr:.2e}{RESET}")
 
             # 9) Epoch log ve checkpoint
             self._log_epoch(tr_acc, tr_loss, val_acc, val_loss)
@@ -529,6 +497,26 @@ class Trainer(nn.Module): # Inherit from nn.Module for DynamicRegularization
         plt.savefig(f"logs/curve_epoch_{self.state.epoch}.png")
         plt.close()
 
+def get_class_balanced_weights(labels, beta=0.99):
+    # labels: torch.Tensor (N,)
+    counts = torch.bincount(labels)
+    effective_num = 1.0 - torch.pow(beta, counts.float())
+    weights = (1.0 - beta) / (effective_num + 1e-8)
+    weights = weights / weights.sum() * len(counts)
+    return weights
+
+def mixup_data(x, y, alpha=0.2):
+    '''Returns mixed inputs, pairs of targets, and lambda'''
+    if alpha > 0:
+        lam = np.random.beta(alpha, alpha)
+    else:
+        lam = 1.0
+    batch_size = x.size()[0]
+    index = torch.randperm(batch_size).to(x.device)
+    mixed_x = lam * x + (1 - lam) * x[index, :]
+    y_a, y_b = y, y[index]
+    return mixed_x, y_a, y_b, lam
+
 def build_dataloaders(batch_size=8, num_workers=2, to_rgb=False, pin_memory=True, persistent_workers=True):
     import platform
     if platform.system() == "Windows":
@@ -553,15 +541,10 @@ def build_dataloaders(batch_size=8, num_workers=2, to_rgb=False, pin_memory=True
         val_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers,
         pin_memory=pin_memory, persistent_workers=persistent_workers
     )
-    # Class weights hesapla
-    labels = [label for _, label in train_ds.samples]
-    label_counts = Counter(labels)
-    num_classes = len(label_counts)
-    class_sample_count = torch.tensor([label_counts.get(i, 0) for i in range(num_classes)], dtype=torch.float32)
-    class_weights = 1. / (class_sample_count + 1e-6)
-    class_weights = class_weights / class_weights.sum() * num_classes
-    class_weights = class_weights.to(torch.device('cuda' if torch.cuda.is_available() else 'cpu'))
-    return train_loader, val_loader, class_weights
+    # Class weights elle başlat
+    cb_weights = torch.tensor([1.06, 0.9, 1.04], dtype=torch.float32)
+    cb_weights = cb_weights.to(torch.device('cuda' if torch.cuda.is_available() else 'cpu'))
+    return train_loader, val_loader, cb_weights
 
 def freeze_support_for_win():
     mp.set_start_method("spawn", force=True)
