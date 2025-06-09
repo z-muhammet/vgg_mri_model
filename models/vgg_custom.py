@@ -73,7 +73,7 @@ class VGGCustom(nn.Module):
             nn.Sequential(
                 ConvBlock(64, 128),            # 64→128
                 ConvBlock(128, 256,stride=1),  # 128→256
-                ConvBlock(256, 512, use_se=True, dilation=2,stride=2), # 256→512
+                ConvBlock(256, 512, dilation=2,stride=2), # 256→512
                 nn.Dropout2d(0.15),
             ),
             # Block 3: 3 Conv, last one with stride=2 (downsampling)

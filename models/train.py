@@ -18,11 +18,12 @@ import torch.nn.functional as F
 import numpy as np
 from sklearn.metrics import confusion_matrix
 import gc
-from torch.optim.lr_scheduler import ReduceLROnPlateau, CosineAnnealingWarmRestarts
+from torch.optim.lr_scheduler import ReduceLROnPlateau, CosineAnnealingWarmRestarts, OneCycleLR, LinearLR, SequentialLR
 from dataclasses import dataclass, field
 from typing import List, Tuple, Optional, Dict
 import math
 import platform
+import optuna # Added for HPO
 
 RED = '\033[91m'
 GREEN = '\033[92m'
@@ -35,13 +36,13 @@ BOLD = '\033[1m'
 
 # Constants for Mixup Alpha Decay
 MIXUP_DECAY_START_EPOCH = 10
-MIXUP_DECAY_END_EPOCH = 50
+MIXUP_DECAY_END_EPOCH = 30
 
 # Hyperparameters
-INITIAL_LR = 5e-4
+INITIAL_LR = 1e-1
 BATCH_SIZE = 8
 NUM_EPOCHS = 60
-WARMUP_EPOCHS = 3
+WARMUP_EPOCHS = 20
 EARLY_STOPPING_PATIENCE = 10
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 GRADIENT_ACCUMULATION_STEPS = 2
@@ -117,7 +118,8 @@ class Trainer(nn.Module):
         plot_every: int = 5,
         checkpoint_dir: str = "models",
         class_weights: torch.Tensor = None,
-        target_lr: float = 5e-3
+        target_lr: float = 5e-3,
+        scheduler_type: str = "reduce_on_plateau"
     ) -> None:
         super().__init__()
         self.model = model.to(device)
@@ -130,21 +132,40 @@ class Trainer(nn.Module):
         self.plot_every = plot_every
         os.makedirs(checkpoint_dir, exist_ok=True)
         self.ckpt_path = os.path.join(checkpoint_dir, "best_vgg_custom.pt")
-        self.optim = torch.optim.AdamW(self.model.parameters(), lr=INITIAL_LR, weight_decay=1e-5)
-        self.scheduler = ReduceLROnPlateau(
+        self.optim = torch.optim.AdamW(self.model.parameters(), lr=target_lr, weight_decay=1e-5)
+
+        # Define schedulers for SequentialLR
+        warmup_steps = WARMUP_EPOCHS * len(train_loader) # Use train_loader directly
+        warmup_scheduler = LinearLR(
             self.optim,
-            mode='min',
-            factor=0.5,
-            patience=5,
-            threshold=1e-2,
-            threshold_mode='rel',
-            cooldown=2,
-            min_lr=1e-6
+            start_factor=1e-8, # Must be > 0
+            end_factor=1.0,
+            total_iters=warmup_steps
         )
+
+        total_training_steps = max_epochs * len(train_loader)
+        remaining_steps = total_training_steps - warmup_steps
+
+        onecycle_scheduler = OneCycleLR(
+            self.optim,
+            max_lr=target_lr, # Use target_lr as max_lr
+            total_steps=remaining_steps,
+            pct_start=0.2,
+            div_factor=10,
+            final_div_factor=10,
+            anneal_strategy='cos'
+        )
+
+        self.scheduler = SequentialLR(
+            self.optim,
+            schedulers=[warmup_scheduler, onecycle_scheduler],
+            milestones=[warmup_steps]
+        )
+
         self.class_weights_cpu = class_weights.clone().detach().cpu()
         self.criterion = nn.CrossEntropyLoss(weight=self.class_weights_cpu.to(self.device))
         self.amp_enabled = self.device.type == "cuda" and (hasattr(torch.cuda, "is_bf16_supported") and torch.cuda.is_bf16_supported())
-        self.scaler = GradScaler(enabled=self.amp_enabled)
+        self.scaler = GradScaler(self.device.type, enabled=self.amp_enabled)
         self.regulariser = DynamicRegularization(self.model, initial_factor=REGULARIZATION_FACTOR)
         self.state = TrainerState()
         self.hist: List[dict] = []
@@ -153,6 +174,7 @@ class Trainer(nn.Module):
         self.mixup_alpha = 0.2
         self._mixup_initial_alpha = self.mixup_alpha
         self._last_logged_mixup_alpha = -1.0
+        self.scheduler_type = scheduler_type
 
     def _run_epoch(self, train: bool = True) -> Tuple[float, float, torch.Tensor, torch.Tensor]:
         """
@@ -185,7 +207,7 @@ class Trainer(nn.Module):
 
                 if train:
                     X, y_a, y_b, lam = mixup_data(X, y, alpha=self.mixup_alpha)
-                    with autocast(device_type=self.device.type, enabled=self.amp_enabled):
+                    with autocast(self.device.type, enabled=self.amp_enabled):
                         out  = self.model(X)
                         loss = lam * self.criterion(out, y_a) + (1 - lam) * self.criterion(out, y_b)
                     
@@ -197,6 +219,7 @@ class Trainer(nn.Module):
                         self.scaler.step(self.optim)
                         self.scaler.update()
                         self.optim.zero_grad(set_to_none=True)
+                        self.scheduler.step() # Call scheduler step here, after optimizer update
                 else:
                     with autocast(device_type=self.device.type, enabled=self.amp_enabled):
                         out  = self.model(X)
@@ -265,7 +288,7 @@ class Trainer(nn.Module):
             return
 
         # Prevent opening Block 2 if rollbacks are insufficient or no improvements
-        if opened == 1 and self.state.no_imp_epochs <= 2:
+        if opened == 1 and self.state.no_imp_epochs <= 5:
             print(f"{YELLOW}[Block] Skipping opening Block-2 at epoch {self.state.epoch} - insufficient rollbacks ({self.state.total_rbs}) or improvements ({self.state.no_imp_epochs}){RESET}")
             return
 
@@ -281,7 +304,7 @@ class Trainer(nn.Module):
         stagnant = all(h["val_loss"] >= val_loss for h in self.hist[-stagnation_window:])
 
         # Open the next block if training is stagnant or validation accuracy is high
-        if (stagnant or val_acc > 0.55) and opened < len(self.model.blocks):
+        if (stagnant or val_acc > 0.75) and opened < len(self.model.blocks):
              self.model.freeze_blocks_until(opened)
              print(f"{CYAN}[Block] Block-{self.model.opened_blocks} opened at epoch {self.state.epoch} (val_acc={val_acc:.3f}, val_loss={val_loss:.3f}){RESET}")
 
@@ -322,14 +345,20 @@ class Trainer(nn.Module):
             self.hist.pop(0)
             gc.collect()
 
-    def train(self):
-        min_lr, max_lr = 5e-6, 1e-2
-        lr_factor_down = 0.85
-        lr_factor_up   = 1.15
+    def _normalize_class_weights(self):
+        # Ağırlıklar toplamını sınıf sayısına eşitle
+        cw = self.class_weights_cpu
+        cw = cw / cw.sum() * len(cw)
+        self.class_weights_cpu = cw
+        # Loss fonksiyonuna da kopyalayın
+        with torch.no_grad():
+            self.criterion.weight.data.copy_(cw.to(self.device))
+        print(f"{GREEN}[Normalize] Class weights normalized: {cw.cpu().numpy()}{RESET}")
 
+    def train(self, trial: Optional[optuna.Trial] = None):
         print("\n=== Training Started ===")
         print(f"Device: {self.device}, Max Epochs: {self.max_epochs}, LR: {self.optim.param_groups[0]['lr']:.2e}")
-        print(f"Batch Size: {self.train_loader.batch_size}, Scheduler: ReduceLROnPlateau\n")
+        print(f"Batch Size: {self.train_loader.batch_size}, Scheduler: SequentialLR (Warmup + OneCycleLR)\n")
 
         def adjust_learning_rate(optimizer, new_lr):
             for pg in optimizer.param_groups:
@@ -341,87 +370,78 @@ class Trainer(nn.Module):
             self.state.epoch = epoch
             t0 = time.time()
 
-            # Warm-up LR adjustment
-            if epoch <= WARMUP_EPOCHS:
-                warmup_lr = INITIAL_LR + (self.target_lr - INITIAL_LR) * (epoch / WARMUP_EPOCHS)
-                for pg in self.optim.param_groups:
-                    pg['lr'] = warmup_lr
-                print(f"{YELLOW}[Warmup] LR set to {warmup_lr:.2e} (epoch {epoch}){RESET}")
-
             # Run training and validation epochs
             tr_loss, tr_acc, tr_corr_tr, tr_tot_tr = self._run_epoch(train=True)
             val_loss, val_acc, val_corr_val, val_tot_val = self._run_epoch(train=False)
 
-            # Scheduler and LR adjustments after warm-up
-            if epoch > WARMUP_EPOCHS:
-                self.scheduler.step(val_loss)
+            # Optuna Pruning
+            if trial is not None:
+                trial.report(val_acc, epoch)
+                # Handle the case where the checkpoint path for the best trial needs to be stored
+                if val_acc > self.state.best_acc: # If this is a new best accuracy for this trial
+                    trial.set_user_attr("ckpt_path", self.ckpt_path)
+                if trial.should_prune():
+                    raise optuna.exceptions.TrialPruned()
 
-                # Gradually reduce Mixup alpha every 10 epochs
-                if epoch > MIXUP_DECAY_START_EPOCH:
-                    num_decay_intervals = (epoch - MIXUP_DECAY_START_EPOCH) // 10
-                    decay_per_interval = self._mixup_initial_alpha / ((MIXUP_DECAY_END_EPOCH - MIXUP_DECAY_START_EPOCH) / 10)
-                    new_mixup_alpha = self._mixup_initial_alpha - (num_decay_intervals * decay_per_interval)
-                    self.mixup_alpha = max(0.0, new_mixup_alpha)
-                    if self.mixup_alpha != self._last_logged_mixup_alpha:
-                        print(f"{YELLOW}[Mixup] Mixup alpha reduced to {self.mixup_alpha:.2f} at epoch {epoch}{RESET}")
-                        self._last_logged_mixup_alpha = self.mixup_alpha
+            # Mixup Alpha adjustment (Linear decay from initial_alpha to 0 by epoch 45)
+            mixup_end_epoch = 30
 
-                # Log LR changes
-                current_lr = self.optim.param_groups[0]['lr']
-                if abs(current_lr - self.optim.param_groups[0]['lr']) > 1e-8:
-                    print(f"{YELLOW}[LR Scheduler] LR changed: {self.optim.param_groups[0]['lr']:.2e} → {current_lr:.2e} (epoch {epoch}){RESET}")
+            if self.state.epoch <= mixup_end_epoch:
+                # Calculate decay progress. At epoch 1, progress is 0. At epoch 45, progress is 1.
+                decay_progress = (self.state.epoch - 1) / (mixup_end_epoch - 1 + 1e-8) # Add small epsilon to avoid division by zero if end_epoch is 1
+                new_mixup_alpha = self._mixup_initial_alpha * (1 - decay_progress)
+                self.mixup_alpha = max(0.0, new_mixup_alpha) # Ensure it doesn't go below 0
+                if self.mixup_alpha != self._last_logged_mixup_alpha:
+                    print(f"{YELLOW}[Mixup] Mixup alpha linearly decayed to {self.mixup_alpha:.2f} at epoch {self.state.epoch}{RESET}")
+                    self._last_logged_mixup_alpha = self.mixup_alpha
+            elif self.state.epoch > mixup_end_epoch:
+                if self.mixup_alpha > 0.0:
+                    self.mixup_alpha = 0.0
+                    print(f"{YELLOW}[Mixup] Mixup alpha set to {self.mixup_alpha:.2f} at epoch {self.state.epoch}{RESET}")
+                    self._last_logged_mixup_alpha = self.mixup_alpha
 
-                # Decrease cooldown counter
-                if self.state.cooldown > 0:
-                    self.state.cooldown -= 1
+            # Decrease cooldown counter
+            if self.state.cooldown > 0:
+                self.state.cooldown -= 1
 
-                # Calculate gap
-                gap     = tr_acc - val_acc
-                gap_abs = abs(gap)
+            # Calculate gap
+            gap     = tr_acc - val_acc
+            gap_abs = abs(gap)
 
-                if gap_abs >= ROLLBACK_GAP_THRESH:
-                    self._maybe_rollback(val_acc, val_loss)
+            if gap_abs >= ROLLBACK_GAP_THRESH:
+                self._maybe_rollback(val_acc, val_loss)
 
-                else:
-                    # Class-based weight update (ClassPenalty) for moderate gap
-                    if PENALTY_GAP_LOW <= gap_abs < PENALTY_GAP_HIGH:
-                        train_acc_cls = tr_corr_tr / (tr_tot_tr + 1e-8)
-                        val_acc_cls   = val_corr_val / (val_tot_val + 1e-8)
-                        per_class_gap = train_acc_cls - val_acc_cls
-                        for cls, g in enumerate(per_class_gap.cpu()):
-                            if g > PENALTY_GAP_LOW:
-                                self.class_weights_cpu[cls] *= 0.97
-                        self.class_weights_cpu = self.class_weights_cpu / self.class_weights_cpu.sum() * len(self.class_weights_cpu)
-                        with torch.no_grad():
-                            self.criterion.weight.data.copy_(self.class_weights_cpu.to(self.device))
-                        print(f"{YELLOW}[ClassPenalty] per_class_gap: {per_class_gap.cpu().numpy()}")
-                        print(f"{YELLOW}[ClassPenalty] new weights: {self.class_weights_cpu.cpu().numpy()}{RESET}")
+            else:
+                # Class-based weight update (ClassPenalty) for moderate gap
+                if PENALTY_GAP_LOW <= gap_abs < PENALTY_GAP_HIGH:
+                    train_acc_cls = tr_corr_tr / (tr_tot_tr + 1e-8)
+                    val_acc_cls   = val_corr_val / (val_tot_val + 1e-8)
+                    per_class_gap = train_acc_cls - val_acc_cls
+                    for cls, g in enumerate(per_class_gap.cpu()):
+                        if g > PENALTY_GAP_LOW:
+                            self.class_weights_cpu[cls] *= 1.03  # increase weight for overfitting class
+                        elif g < -PENALTY_GAP_LOW:
+                            self.class_weights_cpu[cls] *= 0.97  # decrease weight for underperforming/unusual class
+                    self.class_weights_cpu = self.class_weights_cpu / self.class_weights_cpu.sum() * len(self.class_weights_cpu)
+                    with torch.no_grad():
+                        self.criterion.weight.data.copy_(self.class_weights_cpu.to(self.device))
+                    print(f"{YELLOW}[ClassPenalty] per_class_gap: {per_class_gap.cpu().numpy()}")
+                    print(f"{YELLOW}[ClassPenalty] new weights: {self.class_weights_cpu.cpu().numpy()}{RESET}")
 
-                # Attempt to open block
-                self._maybe_open_block(val_acc, val_loss)
+            # Normalize class weights every 10 epochs
+            if self.state.epoch % 10 == 0:
+                self._normalize_class_weights()
 
-                # Regularization for over/underfitting
-                if gap > self.overfit_thr:
-                    self.regulariser.increase_regularization()
-                    print(f"{YELLOW}[Regulariser] Overfit detected (gap={gap:.3f}), regularisation increased to {self.regulariser.factor:.2f}{RESET}")
-                elif val_acc < self.underfit_thr:
-                    self.regulariser.decrease_regularization()
-                    print(f"{YELLOW}[Regulariser] Underfit detected (val_acc={val_acc:.3f}), regularisation decreased to {self.regulariser.factor:.2f}{RESET}")
+            # Attempt to open block
+            self._maybe_open_block(val_acc, val_loss)
 
-                # Adjust LR during cooldown
-                if self.state.cooldown > 0:
-                    if gap > self.overfit_thr:
-                        new_lr = max(self.optim.param_groups[0]['lr'] * lr_factor_down, min_lr)
-                        if new_lr < self.optim.param_groups[0]['lr'] - 1e-8:
-                            adjust_learning_rate(self.optim, new_lr)
-                            self.scheduler.num_bad_epochs = 0
-                            print(f"{YELLOW}[LR Adjust] Overfit: LR decreased to {new_lr:.2e}{RESET}")
-                    elif val_acc < self.underfit_thr:
-                        new_lr = min(self.optim.param_groups[0]['lr'] * lr_factor_up, max_lr)
-                        if new_lr > self.optim.param_groups[0]['lr'] + 1e-8:
-                            adjust_learning_rate(self.optim, new_lr)
-                            self.scheduler.num_bad_epochs = 0
-                            print(f"{YELLOW}[LR Adjust] Underfit: LR increased to {new_lr:.2e}{RESET}")
+            # Regularization for over/underfitting
+            if gap > self.overfit_thr:
+                self.regulariser.increase_regularization()
+                print(f"{YELLOW}[Regulariser] Overfit detected (gap={gap:.3f}), regularisation increased to {self.regulariser.factor:.2f}{RESET}")
+            elif val_acc < self.underfit_thr:
+                self.regulariser.decrease_regularization()
+                print(f"{YELLOW}[Regulariser] Underfit detected (val_acc={val_acc:.3f}), regularisation decreased to {self.regulariser.factor:.2f}{RESET}")
 
             # Epoch log and checkpoint
             self._log_epoch(tr_acc, tr_loss, val_acc, val_loss)
@@ -452,18 +472,12 @@ class Trainer(nn.Module):
             )
             print(f"{CYAN}[TrainerState]{RESET} epoch={epoch}, best_acc={self.state.best_acc:.3f}, total_rbs={self.state.total_rbs}, cooldown={self.state.cooldown}, no_imp_epochs={self.state.no_imp_epochs}")
 
-            # Plot history and early stopping check
-            if epoch % self.plot_every == 0 or epoch == self.max_epochs:
-                self._plot_history()
-            if val_acc >= 0.958:
-                print(f"{GREEN}Target accuracy reached – stopping early.{RESET}")
-                break
-
             # Clear cache and report memory
             torch.cuda.empty_cache()
             gc.collect()
 
         print(f"\nTraining finished. Best val-acc = {self.state.best_acc:.3f}")
+        self._plot_history()
 
     def _plot_history(self):
         xs = [h["epoch"] for h in self.hist]
@@ -526,7 +540,7 @@ def build_dataloaders(batch_size=8, num_workers=2, to_rgb=False, pin_memory=True
         val_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers,
         pin_memory=pin_memory, persistent_workers=persistent_workers
     )
-    cb_weights = torch.tensor([1.06, 0.9, 1.04], dtype=torch.float32)
+    cb_weights = torch.tensor([1.1035788, 0.93700093, 0.9594203], dtype=torch.float32)
     cb_weights = cb_weights.to(torch.device('cuda' if torch.cuda.is_available() else 'cpu'))
     return train_loader, val_loader, cb_weights
 
@@ -551,7 +565,7 @@ if __name__ == "__main__":
         train_loader=train_loader,
         val_loader=val_loader,
         device=device,
-        lr=5e-4,
+        lr=1e-1,
         max_epochs=60,
         plot_every=10,
         class_weights=class_weights
