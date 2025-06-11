@@ -5,23 +5,6 @@ from tqdm import tqdm
 
 # Define number of groups for GroupNorm
 num_groups = 32
-
-class SEBlock(nn.Module):
-    def __init__(self, channels: int, reduction: int = 16):
-        super().__init__()
-        self.squeeze = nn.AdaptiveAvgPool2d(1)
-        self.excite = nn.Sequential(
-            nn.Linear(channels, channels // reduction, bias=False),
-            nn.GELU(),
-            nn.Linear(channels // reduction, channels, bias=False),
-            nn.Sigmoid(),
-        )
-    def forward(self, x):
-        b, c, _, _ = x.shape
-        y = self.squeeze(x).view(b, c)
-        y = self.excite(y).view(b, c, 1, 1)
-        return x * y
-
 class TrainOnlyNoise(nn.Module):
     def __init__(self, std: float = 0.05):
         super().__init__()
@@ -34,17 +17,17 @@ class TrainOnlyNoise(nn.Module):
         return x
 
 class ConvBlock(nn.Module):
-    def __init__(self, in_ch: int, out_ch: int, *, stride: int = 1,
-                 use_se: bool = False, dilation: int = 1):
+    def __init__(self, in_ch: int, out_ch: int, *, stride: int = 1, dilation: int = 1):
         super().__init__()
-        pad = dilation
+        kernel_size = 5
+        pad = dilation * (kernel_size // 2)
         self.core = nn.Sequential(
-            nn.Conv2d(in_ch, out_ch, kernel_size=3,
+            nn.Conv2d(in_ch, out_ch, kernel_size=kernel_size,
                       stride=stride, padding=pad,
                       dilation=dilation, bias=False),
             nn.GroupNorm(num_groups, out_ch),
             nn.GELU(),
-            SEBlock(out_ch) if use_se else nn.Identity(),
+            nn.Identity(),
         )
         self.shortcut = (
             nn.Identity()
@@ -65,22 +48,22 @@ class VGGCustom(nn.Module):
         self.blocks = nn.ModuleList([
             # Block 1: 4 Conv, last one with stride=2 (downsampling)
             nn.Sequential(
-                ConvBlock(in_channels, 32),   # 3→32
-                ConvBlock(32, 64,stride=2),            # 32→64
+                ConvBlock(in_channels, 32),
+                ConvBlock(32, 64, stride=2, dilation=1),
                 nn.Dropout2d(0.1),
             ),
             # Block 2: 3 Conv, last one with stride=2 (downsampling)
             nn.Sequential(
-                ConvBlock(64, 128),            # 64→128
-                ConvBlock(128, 256,stride=1),  # 128→256
-                ConvBlock(256, 512, dilation=2,stride=2), # 256→512
-                nn.Dropout2d(0.15),
+                ConvBlock(64, 128, dilation=4),
+                ConvBlock(128, 256, stride=1, dilation=2),
+                ConvBlock(256, 512, dilation=2, stride=2),
+                nn.Dropout2d(0.2),
             ),
             # Block 3: 3 Conv, last one with stride=2 (downsampling)
             nn.Sequential(
-                ConvBlock(128, 128),              # 128→128
-                ConvBlock(128, 128),              # 128→128
-                ConvBlock(128, 256, stride=2, use_se=True), # 128→256 (258 -> 256)
+                ConvBlock(512, 128),
+                ConvBlock(128, 128),
+                ConvBlock(128, 256, stride=2),
                 nn.Dropout2d(0.3),
             ),
         ])
@@ -94,8 +77,8 @@ class VGGCustom(nn.Module):
         ])
 
         self.classifier = nn.Sequential(
-            nn.BatchNorm1d(512),
-            nn.SiLU(),
+            nn.BatchNorm1d(512, momentum=0.01),
+            nn.Mish(),
             nn.Linear(512, num_classes),
         )
         self._init_weights()
