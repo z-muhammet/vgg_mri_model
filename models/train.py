@@ -44,7 +44,7 @@ COSINE_START_EPOCH = 20
 INITIAL_LR = 1e-2
 BATCH_SIZE = 12
 NUM_EPOCHS = 60
-SWA_START_EPOCH = NUM_EPOCHS + 1
+SWA_START_EPOCH = NUM_EPOCHS + 1 # SWA kapatıldı (eğitimin bitiminden sonra başlar)
 WARMUP_EPOCHS = 0
 EARLY_STOPPING_PATIENCE = 10
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -133,9 +133,9 @@ class Trainer(nn.Module):
         class_weights: torch.Tensor = None,
         target_lr: float = 1e-2,
         scheduler_type: str = "reduce_on_plateau",
-        pct_start: float = 0.2,
-        div_factor: float = 10,
-        final_div_factor: float = 10,
+        pct_start: float = 0.4,
+        div_factor: float = 10.0,
+        final_div_factor: float = 1e3,
         mixup_alpha: float = 0.2,
         weight_decay: float = 5e-4
     ) -> None:
@@ -173,9 +173,9 @@ class Trainer(nn.Module):
                 self.optim,
                 max_lr=target_lr, # Use target_lr as max_lr
                 total_steps=onecycle_total_iters,
-                pct_start=pct_start, # Standard for OneCycleLR warm-up
-                div_factor=div_factor, # from HPO
-                final_div_factor=final_div_factor, # from HPO
+                pct_start=0.4, # Increased pct_start for longer warm-up
+                div_factor=10.0, # Reduced div_factor for less aggressive decay
+                final_div_factor=1e3, # Reduced final_div_factor for less aggressive decay
                 anneal_strategy='cos'
             )
 
@@ -228,9 +228,8 @@ class Trainer(nn.Module):
             self.scheduler = ReduceLROnPlateau(
                 self.optim,
                 mode='min',
-                factor=0.5,
-                patience=EARLY_STOPPING_PATIENCE // 2, # Half of early stopping patience
-                verbose=True,
+                factor=0.2,
+                patience=3,
                 min_lr=1e-7
             )
             self.scheduler_is_per_batch = False
@@ -256,38 +255,40 @@ class Trainer(nn.Module):
         # Early training phase (0-10 epochs): Slightly higher augmentation
         if epoch < 10:
             return A.Compose([
-                A.Rotate(limit=10, p=0.4), # Reduced limit and p
-                A.RandomRotate90(p=0.2), # Reduced p
+                A.Rotate(limit=5, p=0.3),
+                A.RandomRotate90(p=0.1),
                 A.OneOf([
                     A.HorizontalFlip(p=1.0),
                     A.VerticalFlip(p=1.0),
-                ], p=0.4), # Reduced p
+                ], p=0.3),
                 A.Affine(
-                    translate_percent={'x': 0.03, 'y': 0.03}, # Reduced
-                    scale={'x': (0.95, 1.05), 'y': (0.95, 1.05)}, # Reduced
+                    translate_percent={'x': 0.02, 'y': 0.02},
+                    scale={'x': (0.96, 1.04), 'y': (0.96, 1.04)},
                     rotate=0,
                     shear={'x': 0.0, 'y': 0.0},
-                    p=0.4 # Reduced p
+                    p=0.3
                 ),
-                A.RandomBrightnessContrast(brightness_limit=0.1, contrast_limit=0.1, p=0.4), # Reduced limits and p
+                A.RandomBrightnessContrast(brightness_limit=0.08, contrast_limit=0.08, p=0.3),
+                A.GaussNoise(std_range=(0.005, 0.015), mean_range=(0.0, 0.0), p=0.1),
             ])
         # Middle training phase (10-40 epochs): Moderate augmentation (softened)
         elif epoch < 40:
             return A.Compose([
-                A.Rotate(limit=5, p=0.2), # Reduced limit and p
-                A.RandomRotate90(p=0.1), # Reduced p
+                A.Rotate(limit=3, p=0.1),
+                A.RandomRotate90(p=0.05),
                 A.OneOf([
                     A.HorizontalFlip(p=1.0),
                     A.VerticalFlip(p=1.0),
-                ], p=0.2), # Reduced p
+                ], p=0.1),
                 A.Affine(
-                    translate_percent={'x': 0.01, 'y': 0.01}, # Reduced
-                    scale={'x': (0.98, 1.02), 'y': (0.98, 1.02)}, # Reduced
+                    translate_percent={'x': 0.005, 'y': 0.005},
+                    scale={'x': (0.99, 1.01), 'y': (0.99, 1.01)},
                     rotate=0,
                     shear={'x': 0.0, 'y': 0.0},
-                    p=0.2 # Reduced p
+                    p=0.1
                 ),
-                A.RandomBrightnessContrast(brightness_limit=0.03, contrast_limit=0.03, p=0.2), # Reduced limits and p
+                A.RandomBrightnessContrast(brightness_limit=0.02, contrast_limit=0.02, p=0.1),
+                A.GaussNoise(std_range=(0.003, 0.008), mean_range=(0.0, 0.0), p=0.05),
             ])
         # Final training phase (40+ epochs): Minimal augmentation
         else:
@@ -413,16 +414,10 @@ class Trainer(nn.Module):
         if opened >= len(self.model.blocks):
             return
 
-        # New condition for opening Block 2: open if total rollbacks indicate some instability or if stagnation is detected.
-        # This makes sure the model had a chance to stabilize or if it's not improving, we try opening a new block.
-        if opened == 1: # Block 2 is not allowed to open for now.
-            print(f"{YELLOW}[Block] Skipping opening Block-2 at epoch {self.state.epoch} - Block 2 is not allowed to open for now.{RESET}")
+        # Explicitly prevent Block 3 from opening
+        if opened == 2:
+            print(f"{YELLOW}[Block] Skipping opening Block-3 at epoch {self.state.epoch} - 3rd block is not allowed to open.{RESET}")
             return
-
-        # Prevent opening Block 3 if total rollbacks haven't reached a certain threshold (implies instability)
-        if opened == 2: # 3rd block is not allowed to open.
-             print(f"{YELLOW}[Block] Skipping opening Block-3 at epoch {self.state.epoch} - 3rd block is not allowed to open.{RESET}")
-             return
 
         # Check for stagnation: if validation loss has not improved significantly in recent epochs
         stagnation_window = max(2, min(len(self.hist), ROLLBACK_WINDOW // 2))
@@ -431,14 +426,14 @@ class Trainer(nn.Module):
 
         stagnant = all(h["val_loss"] >= val_loss for h in self.hist[-stagnation_window:])
 
-        # Open the next block if training is stagnant or validation accuracy is high
-        # Added a condition for total_rbs for opening block 2 to ensure we've had some instability before trying to open it.
-        if (stagnant or val_acc > 0.55) and opened < len(self.model.blocks):
-            # Specific condition for opening Block 2 to ensure it's not too early or unstable
-            if opened == 1 and self.state.no_imp_epochs < 3: # If Block 2, and not enough stagnation, defer opening
-                print(f"{YELLOW}[Block] Deferring Block-2 opening at epoch {self.state.epoch} - aiming for more stability first before opening Block 2.{RESET}")
+        # Conditions for opening a block
+        # Only consider opening if stagnant or validation accuracy is high (general condition)
+        # And if the current block isn't the last block (Block 3 which is forbidden)
+        if (stagnant or val_acc > 0.55) and opened < 2:
+            # Specific condition for opening Block 2: open after a certain epoch regardless of stagnation, to allow more complex learning.
+            if opened == 1 and self.state.epoch < 15: # Force Block 2 to open at epoch 15
+                print(f"{YELLOW}[Block] Deferring Block-2 opening at epoch {self.state.epoch} - Waiting for epoch 15 to open Block 2.{RESET}")
                 return
-
             self.model.freeze_blocks_until(opened)
             print(f"{CYAN}[Block] Block-{self.model.opened_blocks} opened at epoch {self.state.epoch} (val_acc={val_acc:.3f}, val_loss={val_loss:.3f}){RESET}")
 
@@ -808,10 +803,10 @@ if __name__ == "__main__":
         max_epochs=NUM_EPOCHS,
         plot_every=10,
         class_weights=class_weights,
-        scheduler_type="one_cycle",
-        pct_start=0.3,
-        div_factor=25.0,
-        final_div_factor=1e4,
+        scheduler_type="reduce_on_plateau",
+        pct_start=0.4,
+        div_factor=10.0,
+        final_div_factor=1e3,
         mixup_alpha=0.2,
         weight_decay=5e-4
     )
