@@ -1,7 +1,7 @@
 import torch
 import os
 import numpy as np
-from models.vgg_custom import VGGCustom
+from models.basic_cnn_model import BasicCNNModel
 from models.train import build_dataloaders # Import build_dataloaders
 
 RED = '\033[91m'
@@ -30,7 +30,7 @@ def run_test():
     print(f"[DEBUG] Test dataset size: {len(test_loader.dataset)}")
 
     # Load the best trained PyTorch model
-    model = VGGCustom(num_classes=3, in_channels=3) # Instantiate your model architecture
+    model = BasicCNNModel(num_classes=3, in_channels=3) # Instantiate your model architecture
     best_model_path = os.path.join("models", "best_vgg_custom.pt")
 
     if not os.path.exists(best_model_path):
@@ -68,6 +68,16 @@ def run_test():
     print(f"\n🎯 {total_samples} test samples: {total_correct} correct predictions.")
     print(f"✅ Test Accuracy: {accuracy:.2f}%")
     print(f"📊 Test Loss: {avg_loss:.3f}")
+
+    # Initialize SWA model if SWA was used in training and model was saved as SWA
+    swa_model_path = os.path.join("models", "best_vgg_custom_swa.pt")
+    if os.path.exists(swa_model_path):
+        print(f"{GREEN}\n=== Testing SWA Model ==={RESET}")
+        swa_model = BasicCNNModel(num_classes=3, in_channels=3) # Use BasicCNNModel here as well
+        swa_model.load_state_dict(torch.load(swa_model_path, map_location=device))
+        swa_model.eval() # Set SWA model to evaluation mode
+        test_loss_swa, test_acc_swa, _, _ = trainer._run_epoch(train=False)
+        print(f"{GREEN}SWA Test Acc: {test_acc_swa:.3f}, SWA Test Loss: {test_loss_swa:.3f}{RESET}")
 
 if __name__ == "__main__":
     run_test()

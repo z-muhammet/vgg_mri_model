@@ -7,7 +7,7 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 from dataset.custom_dataset import CustomTumorDataset
-from models.vgg_custom import VGGCustom
+from models.basic_cnn_model import BasicCNNModel
 from torch.amp import autocast, GradScaler
 import torch.multiprocessing as mp
 import numpy as np
@@ -66,7 +66,7 @@ ROLLBACK_ACC_THRESHOLD = 0.03
 ROLLBACK_LOSS_THRESHOLD = 0.08
 ROLLBACK_COOLDOWN = 5
 MAX_TOTAL_ROLLBACKS = 10
-ROLLBACK_WINDOW = 20
+ROLLBACK_WINDOW = NUM_EPOCHS + 1 # Tüm eğitim geçmişini grafikte göstermek için güncellendi
 PENALTY_GAP_LOW   = 0.1
 PENALTY_GAP_HIGH  = 0.29
 
@@ -437,7 +437,7 @@ class Trainer(nn.Module):
             self.model.freeze_blocks_until(opened)
             print(f"{CYAN}[Block] Block-{self.model.opened_blocks} opened at epoch {self.state.epoch} (val_acc={val_acc:.3f}, val_loss={val_loss:.3f}){RESET}")
 
-    def _log_epoch(self, tr_acc, tr_loss, val_acc, val_loss):
+    def _log_epoch(self, tr_acc, tr_loss, val_acc, val_loss, val_per_class_correct: torch.Tensor, val_per_class_total: torch.Tensor):
         cur = {
             "epoch": self.state.epoch,
             "train_acc": tr_acc,
@@ -446,7 +446,9 @@ class Trainer(nn.Module):
             "val_loss": val_loss,
             "lr": self.optim.param_groups[0]["lr"],
             "mixup_alpha": self.mixup_alpha,
-            "class_weights": self.class_weights_cpu.cpu().numpy().copy()
+            "class_weights": self.class_weights_cpu.cpu().numpy().copy(),
+            "val_per_class_correct": val_per_class_correct.cpu().numpy().copy(),
+            "val_per_class_total": val_per_class_total.cpu().numpy().copy()
         }
 
         # Save model and optimizer state for rollback
@@ -522,17 +524,25 @@ class Trainer(nn.Module):
             if not self.scheduler_is_per_batch:
                 self.scheduler.step(val_loss)
 
+            # Enforce minimum LR between epoch 40 and 50
+            if 40 <= self.state.epoch < 50:
+                current_lr = self.optim.param_groups[0]['lr']
+                if current_lr < 1e-3:
+                    for param_group in self.optim.param_groups:
+                        param_group['lr'] = 1e-3
+                    print(f"{YELLOW}[LR Adjustment] LR forced to 1e-3 at epoch {self.state.epoch}{RESET}")
+
             # Mixup Alpha adjustment based on new schedule
-            if self.state.epoch < 10: # Only apply mixup for epochs 0-9
-                self.mixup_alpha = self._mixup_initial_alpha
-                if self.mixup_alpha != self._last_logged_mixup_alpha:
-                    print(f"{YELLOW}[Mixup] Mixup alpha set to {self.mixup_alpha:.2f} at epoch {self.state.epoch}{RESET}")
-                    self._last_logged_mixup_alpha = self.mixup_alpha
-            elif self.state.epoch >= 10: # From epoch 10 onwards, mixup alpha is 0
-                if self.mixup_alpha > 0.0: # Only log when it changes to 0
-                    self.mixup_alpha = 0.0
-                    print(f"{YELLOW}[Mixup] Mixup alpha set to {self.mixup_alpha:.2f} at epoch {self.state.epoch}{RESET}")
-                    self._last_logged_mixup_alpha = self.mixup_alpha
+            MIXUP_DECAY_END_EPOCH = 15 # Mixup 15. epokta 0 olacak
+            new_mixup_alpha = 0.0
+            if self.state.epoch <= MIXUP_DECAY_END_EPOCH:
+                new_mixup_alpha = max(0.0, self._mixup_initial_alpha - (self._mixup_initial_alpha / MIXUP_DECAY_END_EPOCH) * self.state.epoch)
+            else:
+                new_mixup_alpha = 0.0 # Ensure it's 0 after decay period
+
+            if new_mixup_alpha != self.mixup_alpha:
+                self.mixup_alpha = new_mixup_alpha
+                print(f"{YELLOW}[Mixup] Mixup alpha set to {self.mixup_alpha:.2f} at epoch {self.state.epoch}{RESET}")
 
             # Decrease cooldown counter
             if self.state.cooldown > 0:
@@ -577,7 +587,7 @@ class Trainer(nn.Module):
                 print(f"{YELLOW}[Regulariser] Underfit detected (val_acc={val_acc:.3f}), regularisation decreased to {self.regulariser.factor:.2f}{RESET}")
 
             # Epoch log and checkpoint
-            self._log_epoch(tr_acc, tr_loss, val_acc, val_loss)
+            self._log_epoch(tr_acc, tr_loss, val_acc, val_loss, val_corr_val, val_tot_val)
             if val_acc > self.state.best_acc:
                 self.state.best_acc = val_acc
                 self.state.best_loss = val_loss
@@ -665,11 +675,13 @@ class Trainer(nn.Module):
         lrs = [h["lr"] for h in self.hist] # Extract learning rates
         mixup_alphas = [h["mixup_alpha"] for h in self.hist] # Extract mixup alphas
         class_weights_history = [h["class_weights"] for h in self.hist] # Extract class weights
+        val_per_class_correct_history = [h["val_per_class_correct"] for h in self.hist]
+        val_per_class_total_history = [h["val_per_class_total"] for h in self.hist]
 
-        plt.figure(figsize=(15, 10)) # Increased figure size
+        plt.figure(figsize=(18, 12)) # Increased figure size for more subplots
 
         # Plot Accuracy
-        plt.subplot(2, 2, 1) # Changed to 2x2 grid
+        plt.subplot(2, 3, 1) # Changed to 2x3 grid
         plt.plot(xs, tr_acc, label="train")
         plt.plot(xs, val_acc, label="val")
         # Add vertical lines for rollback epochs on the accuracy plot
@@ -678,7 +690,7 @@ class Trainer(nn.Module):
         plt.xlabel("epoch"); plt.ylabel("acc"); plt.grid(); plt.legend()
 
         # Plot Loss
-        plt.subplot(2, 2, 2) # New subplot for Loss
+        plt.subplot(2, 3, 2) # Changed to 2x3 grid
         plt.plot(xs, tr_loss, label="train")
         plt.plot(xs, val_loss, label="val")
         # Add vertical lines for rollback epochs on the loss plot
@@ -687,13 +699,13 @@ class Trainer(nn.Module):
         plt.xlabel("epoch"); plt.ylabel("loss"); plt.grid(); plt.legend()
 
         # Plot Learning Rate
-        plt.subplot(2, 2, 3) # New subplot for LR
+        plt.subplot(2, 3, 3) # Changed to 2x3 grid
         plt.plot(xs, lrs, label="LR")
         plt.xlabel("epoch"); plt.ylabel("Learning Rate"); plt.grid(); plt.legend()
         plt.yscale('log') # Use log scale for LR for better visualization
 
         # Plot Mixup Alpha and Class Weights
-        plt.subplot(2, 2, 4) # New subplot for Mixup Alpha and Class Weights
+        plt.subplot(2, 3, 4) # Changed to 2x3 grid
         plt.plot(xs, mixup_alphas, label="Mixup Alpha", linestyle='--')
         # Plot each class weight
         num_classes = len(class_weights_history[0]) if class_weights_history else 0
@@ -701,6 +713,21 @@ class Trainer(nn.Module):
             plt.plot(xs, [cw[i] for cw in class_weights_history], label=f"Class {i} Weight")
 
         plt.xlabel("epoch"); plt.ylabel("Value"); plt.grid(); plt.legend()
+
+        # Plot Per-Class Validation Accuracy
+        plt.subplot(2, 3, 5) # New subplot for Per-Class Accuracy
+        if val_per_class_correct_history and val_per_class_total_history:
+            num_classes_plot = len(val_per_class_correct_history[0])
+            for i in range(num_classes_plot):
+                per_class_acc = [
+                    (val_per_class_correct_history[j][i] / (val_per_class_total_history[j][i] + 1e-8))
+                    for j in range(len(xs))
+                ]
+                plt.plot(xs, per_class_acc, label=f"Class {i} Acc")
+            plt.xlabel("epoch"); plt.ylabel("Per-Class Accuracy"); plt.grid(); plt.legend()
+        else:
+            plt.text(0.5, 0.5, "No per-class data available", horizontalalignment='center', verticalalignment='center', transform=plt.gca().transAxes)
+
 
         plt.tight_layout()
         os.makedirs("logs", exist_ok=True)
@@ -793,7 +820,7 @@ if __name__ == "__main__":
     print(f"[DEBUG] Train dataset size: {len(train_loader.dataset)}")
     print(f"[DEBUG] Test dataset size: {len(test_loader.dataset)}")
 
-    model = VGGCustom(num_classes=3, in_channels=3)
+    model = BasicCNNModel(num_classes=3, in_channels=3)
     trainer = Trainer(
         model,
         train_loader=train_loader,
@@ -818,7 +845,7 @@ if __name__ == "__main__":
     if os.path.exists(best_model_path):
         trainer.model.load_state_dict(torch.load(best_model_path, map_location=device))
         trainer.model.eval() # Set model to evaluation mode
-        test_loss, test_acc, _, _ = trainer._run_epoch(train=False)
+        test_loss, test_acc, test_corr_val, test_tot_val = trainer._run_epoch(train=False) # Pass all return values
         print(f"{GREEN}Test Acc: {test_acc:.3f}, Test Loss: {test_loss:.3f}{RESET}")
     else:
         print(f"{RED}Best model checkpoint not found at {best_model_path}. Please train the model first.{RESET}")
