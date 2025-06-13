@@ -141,7 +141,7 @@ Veri seti işlemleri için özel bir PyTorch `Dataset` sınıfı kullanılmışt
 Projeyi çalıştırmak için gerekli bağımlılıkları yüklemeniz ve ardından `models/train.py` betiğini çalıştırmanız yeterlidir.
 
 
-# Bağımlılıkları yükleyin (varsayılan olarak bir requirements.txt dosyasının olduğunu varsayalım)
+# Bağımlılıkları yükleyin 
 pip install -r requirements.txt
 
 # Modeli eğitin
