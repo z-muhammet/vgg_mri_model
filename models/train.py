@@ -557,6 +557,27 @@ class Trainer(nn.Module):
                         self.criterion.weight.data.copy_(self.class_weights_cpu.to(self.device))
                     print(f"{YELLOW}[ClassPenalty] per_class_gap: {per_class_gap.cpu().numpy()}")
                     print(f"{YELLOW}[ClassPenalty] new weights: {self.class_weights_cpu.cpu().numpy()}{RESET}")
+            
+            if self.state.epoch == 40:
+                # Increase weight for '1_menin' (index 1) by 5% at epoch 40
+                self.class_weights_cpu[1] *= 1.05
+                with torch.no_grad():
+                    self.criterion.weight.data.copy_(self.class_weights_cpu.to(self.device))
+                print(f"{YELLOW}[Class Weight Adjustment] Increased weight for '1_menin' by 5% at epoch {self.state.epoch}. New weights: {self.class_weights_cpu.cpu().numpy()}{RESET}")
+
+            if self.state.epoch == 50:
+                # Increase weight for '1_menin' (index 1) by 3% at epoch 50
+                self.class_weights_cpu[1] *= 1.03
+                with torch.no_grad():
+                    self.criterion.weight.data.copy_(self.class_weights_cpu.to(self.device))
+                print(f"{YELLOW}[Class Weight Adjustment] Increased weight for '1_menin' by 3% at epoch {self.state.epoch}. New weights: {self.class_weights_cpu.cpu().numpy()}{RESET}")
+
+            if self.state.epoch == 55:
+                # Increase weight for '1_menin' (index 1) by 2% at epoch 55
+                self.class_weights_cpu[1] *= 1.02
+                with torch.no_grad():
+                    self.criterion.weight.data.copy_(self.class_weights_cpu.to(self.device))
+                print(f"{YELLOW}[Class Weight Adjustment] Increased weight for '1_menin' by 2% at epoch {self.state.epoch}. New weights: {self.class_weights_cpu.cpu().numpy()}{RESET}")
 
             if self.state.epoch % 10 == 0:
                 self._normalize_class_weights()

@@ -38,10 +38,10 @@ checkpoint_path = os.path.join("models", "full_vgg_custom.pt") # Yüklenecek mod
 
 if os.path.exists(checkpoint_path):
     state_dict = torch.load(checkpoint_path, map_location=DEVICE)
-    model.load_state_dict(state_dict)
+    model.load_state_dict(state_dict["model_state"])
 
     # Eğitimdeki konfigürasyonu geri getir:
-    model.freeze_blocks_until(1)   # 0 ve 1 açık  → opened_blocks = 2
+    model.opened_blocks = state_dict["opened_blocks"]   # 0 ve 1 açık  → opened_blocks = 2
 
     model.eval()          # ⚠️ kritik: dropout/noise katmanlarını kapatır
     print(f"🤖 Eğitilmiş model {checkpoint_path} yüklendi.")
@@ -81,7 +81,10 @@ sns.heatmap(cm, annot=True, fmt="d", cmap="Blues", xticklabels=class_names, ytic
 plt.xlabel('Tahmin Edilen Etiket')
 plt.ylabel('Gerçek Etiket')
 plt.title('Karışıklık Matrisi')
-plt.show()
+plt.tight_layout()
+os.makedirs("logs", exist_ok=True)  # log dizininin var olduğundan emin olun
+plt.savefig(os.path.join("logs", "confusion_matrix_test.png")) # Karışıklık matrisini kaydet
+plt.close() # Grafiği kapatın
 
 print("\nSınıflandırma Raporu:")
 print(classification_report(all_labels, all_preds, target_names=class_names))

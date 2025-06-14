@@ -50,8 +50,7 @@ class BasicCNNModel(nn.Module):
             ),
             # Block 2: 3 Conv, last one with stride=2 (downsampling)
             nn.Sequential(
-                ConvBlock(64, 128, dilation=4),
-                ConvBlock(128, 256, stride=1, dilation=2),
+                ConvBlock(64, 256, dilation=4),
                 ConvBlock(256, 512, dilation=2, stride=2,dropout= 0.2),
             ),
             # Block 3: 3 Conv, last one with stride=2 (downsampling)
