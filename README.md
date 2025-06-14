@@ -14,9 +14,9 @@ Bu proje, beyin MRI görüntülerinden tümör tespiti ve sınıflandırması i�
 
 Projenin kalbinde, özel olarak tasarlanmış `BasicCNNModel` adında VGG benzeri bir Evrişimsel Sinir Ağı (CNN) bulunmaktadır.
 
-*   **Temel Katmanlar:** `nn.Conv2d`, `nn.GroupNorm`, `nn.GELU`, `nn.Identity`, `nn.Dropout2d`, `nn.AdaptiveAvgPool2d`, `nn.BatchNorm1d`, `nn.Mish`, `nn.Linear`.
+*   **Temel Katmanlar:** `nn.Conv2d`, `nn.GroupNorm`, `nn.SiLU`, `nn.Identity`, `nn.Dropout2d`, `nn.AdaptiveAvgPool2d`, `nn.BatchNorm1d`, `nn.Mish`, `nn.Linear`.
 *   **`TrainOnlyNoise`:** Sadece eğitim sırasında girdi verisine gürültü ekleyen özel bir katman.
-*   **`ConvBlock`:** Her biri evrişim, grup normalizasyonu ve aktivasyon içeren temel yapı taşları. Atlamalı bağlantılar (shortcut connections) içerir.
+*   **`ConvBlock`:** Her biri evrişim, 32 gruplu grup normalizasyonu ve `SiLU` aktivasyonu içeren temel yapı taşları. Bu bloklar, bir `Dropout2d` ve `TrainOnlyNoise` katmanı da içerir. Kalıntı bağlantılar (shortcut connections) bu blok içinde uygulanmamıştır.
 *   **Blok Yapısı:** Model, ayrı ayrı dondurulabilen ve açılabilen üç ana bloktan oluşur. Bu, aşamalı öğrenme stratejisini mümkün kılar.
 *   **Dinamik Adaptörler:** Son açılan bloğun çıktısını sınıflandırma katmanına uygun hale getiren adaptör katmanları.
 *   **Ağırlık Başlatma:** Kaiming Normal (He normal) ve sabit başlatma teknikleri kullanılmıştır.
@@ -127,7 +127,27 @@ Veri seti işlemleri için özel bir PyTorch `Dataset` sınıfı kullanılmışt
 
 *   **`CustomTumorDataset`:** `.npy` formatındaki ön işlenmiş görüntülerden veri yükler.
 *   **Önbellekleme:** Sık erişilen veriler için bellek önbelleklemesi kullanır.
-*   **Görüntü Artırma ve Dönüşümler:** `Albumentations` kütüphanesi ile çeşitli rastgele dönüşümler, yeniden boyutlandırma ve normalizasyon uygulanır.
+*   **Görüntü Artırma ve Dönüşümler:** `Albumentations` kütüphanesi ile çeşitli rastgele dönüşümler uygulanır. Bu dönüşümler eğitim epoklarına göre dinamik olarak ayarlanır:
+    *   **Erken Eğitim Fazı (0-10 Epok):** Modelin daha çeşitli verilere maruz kalması için daha yüksek şiddetli artırmalar uygulanır.
+        *   `A.Rotate(limit=5, p=0.3)`: Görüntüleri 5 dereceye kadar döndürme olasılığı 0.3.
+        *   `A.RandomRotate90(p=0.1)`: Görüntüleri 90 derece döndürme olasılığı 0.1.
+        *   `A.OneOf([A.HorizontalFlip(p=1.0), A.VerticalFlip(p=1.0)], p=0.3)`: Yatay veya dikey çevirme olasılığı 0.3.
+        *   `A.Affine(translate_percent={'x': 0.02, 'y': 0.02}, scale={'x': (0.96, 1.04), 'y': (0.96, 1.04)}, p=0.3)`: Hafif çeviri ve ölçekleme olasılığı 0.3.
+        *   `A.RandomBrightnessContrast(brightness_limit=0.08, contrast_limit=0.08, p=0.3)`: Parlaklık ve kontrast ayarlama olasılığı 0.3.
+        *   `A.GaussNoise(std_range=(0.005, 0.015), mean_range=(0.0, 0.0), p=0.1)`: Gauss gürültüsü ekleme olasılığı 0.1.
+    *   **Orta Eğitim Fazı (10-40 Epok):** Artırmaların şiddeti ve olasılıkları azaltılarak modelin daha oturmuş öğrenmesine olanak tanınır.
+        *   `A.Rotate(limit=3, p=0.1)`
+        *   `A.RandomRotate90(p=0.05)`
+        *   `A.OneOf([A.HorizontalFlip(p=1.0), A.VerticalFlip(p=1.0)], p=0.1)`
+        *   `A.Affine(translate_percent={'x': 0.005, 'y': 0.005}, scale={'x': (0.99, 1.01), 'y': (0.99, 1.01)}, p=0.1)`
+        *   `A.RandomBrightnessContrast(brightness_limit=0.02, contrast_limit=0.02, p=0.1)`
+        *   `A.GaussNoise(std_range=(0.003, 0.008), mean_range=(0.0, 0.0), p=0.05)`
+    *   **Son Eğitim Fazı (40+ Epok):** Minimal artırmalar uygulanır, genellikle sadece temel dönüşümlerle modelin ince ayar yapmasına izin verilir.
+        *   `A.HorizontalFlip(p=1.0)`: Görüntüleri her zaman yatay çevir.
+    *   **Sabit Dönüşümler:** Tüm artırma aşamalarından sonra uygulanan sabit dönüşümler:
+        *   `A.Resize(224, 224)`: Görüntüleri hedef boyut olan 224x224 piksele yeniden boyutlandırır.
+        *   `A.Normalize(mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5))`: Piksel değerlerini [-1, 1] aralığına normalize eder.
+        *   `ToTensorV2()`: Son adımda NumPy dizilerini PyTorch tensörlerine dönüştürür.
 
 ## Yardımcı Betikler
 

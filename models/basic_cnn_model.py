@@ -4,7 +4,7 @@ import torch.nn.functional as F
 from tqdm import tqdm
 
 # Define number of groups for GroupNorm
-num_groups = 8
+num_groups = 32
 class TrainOnlyNoise(nn.Module):
     def __init__(self, std: float = 0.05):
         super().__init__()
@@ -26,17 +26,16 @@ class ConvBlock(nn.Module):
                               dilation=dilation, bias=False)
         
         self.norm = nn.GroupNorm(num_groups=num_groups, num_channels=out_ch) 
-        self.act = nn.SiLU()  
+        self.act = nn.ReLU()
         self.drop = nn.Dropout2d(dropout) 
-        self.noise = TrainOnlyNoise(std=0.01)  
-        
+        self.noise = TrainOnlyNoise(std=0.01)
     def forward(self, x):
-        x = self.conv(x)
-        x = self.norm(x)
-        x = self.act(x)
-        x = self.drop(x)
-        x = self.noise(x)
-        return x
+        out = self.conv(x)
+        out = self.norm(out)
+        out = self.act(out)
+        out = self.drop(out)
+        out = self.noise(out)
+        return out
 
 
 class BasicCNNModel(nn.Module):
@@ -47,21 +46,19 @@ class BasicCNNModel(nn.Module):
             # Block 1: 4 Conv, last one with stride=2 (downsampling)
             nn.Sequential(
                 ConvBlock(in_channels, 32),
-                ConvBlock(32, 64, stride=2, dilation=1),
-                nn.Dropout2d(0.1),
+                ConvBlock(32, 64, stride=2, dilation=1,dropout=0.1),
             ),
             # Block 2: 3 Conv, last one with stride=2 (downsampling)
             nn.Sequential(
-                ConvBlock(64, 256, dilation=2),
-                ConvBlock(256, 512, dilation=2, stride=2),
-                nn.Dropout2d(0.2),
+                ConvBlock(64, 128, dilation=4),
+                ConvBlock(128, 256, stride=1, dilation=2),
+                ConvBlock(256, 512, dilation=2, stride=2,dropout= 0.2),
             ),
             # Block 3: 3 Conv, last one with stride=2 (downsampling)
             nn.Sequential(
                 ConvBlock(512, 128),
                 ConvBlock(128, 128),
                 ConvBlock(128, 256, stride=2),
-                nn.Dropout2d(0.3),
             ),
         ])
         self.avgpool = nn.AdaptiveAvgPool2d(1)

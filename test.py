@@ -1,83 +1,87 @@
+import os, random
 import torch
-import os
-import numpy as np
+from torch.utils.data import DataLoader, Subset
+from dataset.custom_dataset import CustomTumorDataset
 from models.basic_cnn_model import BasicCNNModel
-from models.train import build_dataloaders # Import build_dataloaders
+from models.train import build_dataloaders # Only import build_dataloaders as Trainer is not used here
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.metrics import confusion_matrix, classification_report # Add classification_report
+import numpy as np
 
-RED = '\033[91m'
-GREEN = '\033[92m'
-YELLOW = '\033[93m'
-BLUE = '\033[94m'
-CYAN = '\033[96m'
-MAGENTA = '\033[95m'
-RESET = '\033[0m'
-BOLD = '\033[1m'
+# Device configuration
+DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-def run_test():
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
+# Model ve veri yükleme
+print("🔁 Veri yükleniyor...")
+# CustomTumorDataset, içinde zaten resize, normalize ve ToTensorV2 dönüşümlerini uygular.
+# train.py'deki build_dataloaders fonksiyonu da to_rgb=True ile çağırır.
+test_root = os.path.join("preprocessed_data", "test") # Dizininize göre güncelleyin
+test_dataset = CustomTumorDataset(test_root, to_rgb=True) # Eğitimdeki to_rgb ayarıyla aynı olmalı
 
-    # Load data
-    _, _, test_loader, _ = build_dataloaders(
-        batch_size=12, # Use the same batch size as training or adjust as needed
-        num_workers=0,
-        pin_memory=False,
-        persistent_workers=False,
-        to_rgb=True
-    )
+# Keras kodundaki gibi 1 000 rastgele örnek seç
+num_samples = 912
+if num_samples > len(test_dataset):
+    print(f"Test seti {num_samples}'den küçük! Tüm test setini kullanılıyor: {len(test_dataset)} örnek.")
+    num_samples = len(test_dataset)
 
-    print(f"[DEBUG] Test dataset size: {len(test_loader.dataset)}")
+indices = random.sample(range(len(test_dataset)), num_samples)
+subset = Subset(test_dataset, indices)
+test_loader = DataLoader(subset, batch_size=1, shuffle=False, num_workers=0, pin_memory=False) # Windows için num_workers=0
 
-    # Load the best trained PyTorch model
-    model = BasicCNNModel(num_classes=3, in_channels=3) # Instantiate your model architecture
-    best_model_path = os.path.join("models", "best_vgg_custom.pt")
+# Sınıf isimlerini al (datasetten doğrudan)
+class_names = test_dataset.class_names
 
-    if not os.path.exists(best_model_path):
-        print(f"{RED}Error: Best model checkpoint not found at {best_model_path}. Please train the model first.{RESET}")
-        return
+# 3 ⟶ Eğitilmiş modeli yükleme
+model = BasicCNNModel(num_classes=len(class_names), in_channels=3).to(DEVICE)
+checkpoint_path = os.path.join("models", "full_vgg_custom.pt") # Yüklenecek modelin yolu
 
-    model.load_state_dict(torch.load(best_model_path, map_location=device))
-    model.to(device)
-    model.eval() # Set model to evaluation mode
+if os.path.exists(checkpoint_path):
+    state_dict = torch.load(checkpoint_path, map_location=DEVICE)
+    model.load_state_dict(state_dict)
 
-    criterion = torch.nn.CrossEntropyLoss() # Assuming CrossEntropyLoss for evaluation
+    # Eğitimdeki konfigürasyonu geri getir:
+    model.freeze_blocks_until(1)   # 0 ve 1 açık  → opened_blocks = 2
 
-    total_correct = 0
-    total_samples = 0
-    total_loss = 0.0
+    model.eval()          # ⚠️ kritik: dropout/noise katmanlarını kapatır
+    print(f"🤖 Eğitilmiş model {checkpoint_path} yüklendi.")
+else:
+    print(f"❌ Model bulunamadı: {checkpoint_path}. Lütfen önce modeli eğitin.")
+    exit()
 
-    print(f"{GREEN}\n=== Starting Test Evaluation ==={RESET}")
+# 4 ⟶ Rastgele örneklerde doğruluk hesabı
+correct = 0
+total = 0
+all_preds, all_labels = [], []
 
-    with torch.no_grad():
-        for X, y in test_loader:
-            X = X.to(device)
-            y = y.to(device)
+print("🔍 Tahminler yapılıyor...")
+with torch.no_grad():           # gradyan gerekmez
+    for imgs, labels in test_loader:
+        imgs, labels = imgs.to(DEVICE), labels.to(DEVICE)
 
-            outputs = model(X)
-            loss = criterion(outputs, y)
+        outputs = model(imgs)
+        preds = outputs.argmax(dim=1)
 
-            _, predicted = torch.max(outputs.data, 1)
-            total_samples += y.size(0)
-            total_correct += (predicted == y).sum().item()
-            total_loss += loss.item() * y.size(0)
+        total += labels.size(0)
+        correct += (preds == labels).sum().item()
 
-    accuracy = 100 * total_correct / total_samples
-    avg_loss = total_loss / total_samples
+        all_preds.append(preds.item()) # batch_size=1 olduğu için item() kullanıyoruz
+        all_labels.append(labels.item()) # batch_size=1 olduğu için item() kullanıyoruz
 
-    print(f"\n🎯 {total_samples} test samples: {total_correct} correct predictions.")
-    print(f"✅ Test Accuracy: {accuracy:.2f}%")
-    print(f"📊 Test Loss: {avg_loss:.3f}")
+# Doğruluk oranı hesapla ve düzgün print et
+accuracy = 100.0 * correct / total # total, döngü içinde hesaplanıyor
+print(f"\n🎯 {total} test örneğinden {correct} tanesi doğru tahmin edildi.")
+print(f"✅ Doğruluk Oranı: {accuracy:.2f}%")
 
-    # Initialize SWA model if SWA was used in training and model was saved as SWA
-    swa_model_path = os.path.join("models", "best_vgg_custom_swa.pt")
-    if os.path.exists(swa_model_path):
-        print(f"{GREEN}\n=== Testing SWA Model ==={RESET}")
-        swa_model = BasicCNNModel(num_classes=3, in_channels=3) # Use BasicCNNModel here as well
-        swa_model.load_state_dict(torch.load(swa_model_path, map_location=device))
-        swa_model.eval() # Set SWA model to evaluation mode
-        test_loss_swa, test_acc_swa, _, _ = trainer._run_epoch(train=False)
-        print(f"{GREEN}SWA Test Acc: {test_acc_swa:.3f}, SWA Test Loss: {test_loss_swa:.3f}{RESET}")
+# 📈 Karışıklık Matrisi Çizimi
+print("📈 Karışıklık Matrisi çiziliyor...")
+cm = confusion_matrix(all_labels, all_preds)
+plt.figure(figsize=(8, 6))
+sns.heatmap(cm, annot=True, fmt="d", cmap="Blues", xticklabels=class_names, yticklabels=class_names)
+plt.xlabel('Tahmin Edilen Etiket')
+plt.ylabel('Gerçek Etiket')
+plt.title('Karışıklık Matrisi')
+plt.show()
 
-if __name__ == "__main__":
-    run_test()
+print("\nSınıflandırma Raporu:")
+print(classification_report(all_labels, all_preds, target_names=class_names))
