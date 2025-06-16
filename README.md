@@ -70,51 +70,38 @@ Not: Her `ConvBlock` içindeki shortcut connection'lar da hesaba katıldığınd
 
 Modelin eğitimi için çeşitli modern teknikler ve algoritmalar kullanılmıştır:
 
-*   **Optimizasyon:** `torch.optim.AdamW`.
-*   **Kayıp Fonksiyonu:** `nn.CrossEntropyLoss` (sınıf dengesizliğini gidermek için sınıf ağırlıkları ile).
-*   **Öğrenme Oranı Çizelgeleyiciler (LR Schedulers):**
-    *   **Başlangıç LR:** `1e-2` ile başlayan ve aşamalı olarak değişen öğrenme oranı stratejisi.
-    *   **Isınma Fazı (Warmup):** İlk 5 epokta lineer artış ile `1e-2`'ye ulaşır.
-    *   **Ana Eğitim Fazı:**
-        *   `OneCycleLR`: 5-20. epoklar arasında maksimum LR'ye (`1e-2`) ulaşır ve sonra azalır.
-        *   `CosineAnnealingLR`: 20-40. epoklar arasında kosinüs dalgası şeklinde LR'yi azaltır.
-        *   `ReduceLROnPlateau`: 40. epoktan sonra doğrulama kaybı plato yaptığında LR'yi 0.1 faktörü ile azaltır.
-    *   **LR Kısıtlamaları:**
-        *   40-50. epoklar arasında minimum LR `1e-3`'ün altına düşmez.
-        *   50. epoktan sonra minimum LR `1e-4`'ün altına düşmez.
-        *   **Dinamik LR Ayarlaması:** Her epok sonunda doğrulama metriklerine göre LR'yi otomatik olarak ayarlar.
-*   **Otomatik Karışık Hassasiyet (AMP):** `torch.amp.autocast` ve `torch.cuda.amp.GradScaler` ile eğitim hızı ve bellek verimliliği artırılır.
-*   **Gradiyent Biriktirme (Gradient Accumulation):** Efektif batch boyutunu artırmak için gradyanlar birden fazla adımda biriktirilir.
-*   **Rastgele Ağırlık Ortalaması (Stochastic Weight Averaging - SWA):** `AveragedModel` kullanılarak eğitimin son aşamalarında model ağırlıklarının ortalaması alınarak genelleme yeteneği artırılır. (Yapılandırmaya göre etkinleştirilebilir/devre dışı bırakılabilir.)
-*   **Mixup:** Veri artırma tekniği olarak Mixup kullanılır. Girdi görüntüleri ve etiketleri lineer olarak karıştırılır. Mixup alfa değeri eğitimin erken aşamalarında lineer olarak azaltılır (0. epoktan 15. epoka kadar).
-*   **Dinamik Düzenlileştirme:** Modelin aşırı veya az öğrenmesine göre dropout oranlarını dinamik olarak ayarlayan bir mekanizma.
-*   **Sıcaklık Ölçeklendirme (Temperature Scaling):** Modelin tahmin güvenilirliğini kalibre etmek için kullanılır.
-*   **Geri Alma Mekanizması (Rollback):** Performans düşüşlerinde modelin önceki iyi ağırlıklara dönmesini sağlar.
-*   **Sınıf Dengeli Ağırlıklar:** Veri setindeki sınıf dengesizliğini ele almak için `get_class_balanced_weights` ile ağırlıklar hesaplanır ve `WeightedRandomSampler` ile DataLoader dengelenir.
-*   **Sınıf Cezası (ClassPenalty):** Eğitim ve doğrulama doğruluğu arasındaki farka göre belirli sınıfların ağırlıklarını dinamik olarak ayarlar.
-*   **Erken Durdurma:** Belirli bir epok boyunca performans artışı olmazsa eğitimi sonlandırır.
-*   **Dinamik Veri Artırma:** Epoklara göre değişen şiddetlerde veri artırma stratejileri uygulanır.
+*   **Optimizasyon:** `torch.optim.AdamW` optimizer, `5e-4` ağırlık azaltma (`weight_decay`) ile kullanılır. Bu, modelin aşırı öğrenmesini engellemeye yardımcı olur.
+*   **Kayıp Fonksiyonu:** `nn.CrossEntropyLoss` kullanılır. Sınıf dengesizliğini gidermek amacıyla `get_class_balanced_weights` fonksiyonu tarafından hesaplanan sınıf ağırlıkları (`class_weights`) ile birlikte kullanılır. Bu ağırlıklar, her 10 epokta bir normalize edilir ve eğitim-doğrulama doğruluğu arasındaki farka göre dinamik olarak ayarlanır (ClassPenalty mekanizması).
+*   **Öğrenme Oranı Çizelgeleyiciler (LR Schedulers):** Esnek ve dinamik bir öğrenme oranı stratejisi uygulanır. Başlangıç öğrenme oranı `1e-2`'dir.
+    *   **`OneCycleLR`:** İlk `COSINE_START_EPOCH` (varsayılan 20) epoka kadar maksimum öğrenme oranına ulaşır ve sonra kosinüs anneal stratejisi ile azaltır. Bu, hızlı yakınsama ve daha iyi genelleme sağlar.
+    *   **`CosineAnnealingLR`:** `COSINE_START_EPOCH`'tan `SWA_START_EPOCH - 1`'e kadar (varsayılan 20-60 arası) öğrenme oranını kosinüs dalgası şeklinde `1e-5` minimum değere kadar azaltır.
+    *   **`LinearLR` (SWA Fazı için):** `SWA_START_EPOCH`'tan (`NUM_EPOCHS + 1`, yani varsayılan 61. epoktan itibaren) eğitim sonuna kadar sabit bir öğrenme oranı (`SWA_LR = 5e-4`) korur. Bu, SWA modelinin stabil bir şekilde yakınsamasına yardımcı olur.
+    *   **`SequentialLR`:** Yukarıdaki çizelgeleyicileri belirli mihenk taşlarında (`milestones`) sırayla etkinleştirir.
+    *   Alternatif olarak, doğrulama kaybı plato yaptığında öğrenme oranını `0.2` faktörü ile azaltan `ReduceLROnPlateau` çizelgeleyici (`patience=3`, `min_lr=1e-7`) de kullanılabilir.
+*   **Mixup:** Girdi görüntüleri ve etiketleri lineer olarak karıştırılarak veri çeşitliliğini artıran bir veri artırma tekniğidir. `mixup_data` fonksiyonu tarafından `alpha=0.2` ile uygulanır. Mixup alfa değeri eğitimin erken aşamalarında (0. epoktan 15. epoka kadar) lineer olarak `0.0`'a düşürülür, bu da modelin başlangıçta daha fazla çeşitlilikle eğitilmesini, sonrasında ise gerçek verilere odaklanmasını sağlar.
+*   **Dinamik Düzenlileştirme (`DynamicRegularization`):** Modelin eğitim performansına (aşırı öğrenme veya az öğrenme) göre dropout oranlarını dinamik olarak ayarlayan bir mekanizmadır. Aşırı öğrenme belirtileri (`tr_acc - val_acc > OVERFIT_THRESHOLD`) görüldüğünde dropout faktörünü artırır, az öğrenme (`val_acc < UNDERFIT_THRESHOLD`) durumunda ise azaltır.
+*   **Sıcaklık Ölçeklendirme (`TemperatureScaler`):** Modelin tahmin güvenilirliklerini kalibre etmek için kullanılan öğrenilebilir bir sıcaklık parametresi (`temperature`) içerir. Eğitim sonunda SWA modeli üzerinde kalibre edilir.
+*   **Geri Alma Mekanizması (Rollback):** Doğrulama doğruluğunda belirgin bir düşüş veya kayıpta artış olduğunda (`acc_drop >= ROLLBACK_ACC_THRESHOLD` veya `loss_rise >= ROLLBACK_LOSS_THRESHOLD`), modelin daha önceki en iyi ağırlıklarına geri dönmesini sağlar. Bu, istenmeyen performans düşüşlerinin önüne geçmek için önemli bir stratejidir. Maksimum 10 geri alma işlemi (`MAX_TOTAL_ROLLBACKS`) ve bir soğuma süresi (`ROLLBACK_COOLDOWN = 5` epok) içerir.
+*   **Sınıf Cezası (ClassPenalty):** Eğitim ve doğrulama doğruluğu arasındaki sınıf bazlı fark (`per_class_gap`) belirli eşikler (`PENALTY_GAP_LOW`, `PENALTY_GAP_HIGH`) içinde olduğunda ve 30. epokdan sonra etkinleşir. Bu durumda, daha kötü performans gösteren sınıfların ağırlıklarını artırarak (`1.03` faktörle) ve daha iyi performans gösteren sınıfların ağırlıklarını azaltarak (`0.97` faktörle) sınıf dengesizliğini eğitim süresince dinamik olarak düzenler. Ayrıca, 40, 50 ve 55. epoklarda '1_menin' sınıfı için özel ağırlık artışları uygulanır.
+*   **Erken Durdurma:** `EARLY_STOPPING_PATIENCE` (varsayılan 18) epok boyunca doğrulama doğruluğunda iyileşme olmazsa eğitim durdurulur. En iyi model ağırlıkları bu süre zarfında kaydedilir.
+*   **Rastgele Ağırlık Ortalaması (Stochastic Weight Averaging - SWA):** `SWA_START_EPOCH`'tan itibaren (`NUM_EPOCHS + 1`, yani varsayılan 61. epok) `AveragedModel` kullanılarak model ağırlıklarının ortalaması alınarak genelleme yeteneği artırılır. Eğitim sonunda `update_bn` ile BatchNorm katmanları güncellenir ve SWA modeli ayrı bir checkpoint olarak kaydedilir.
+*   **Aşamalı Öğrenme (Progressive Learning):** `models/basic_cnn_model.py`'de tanımlanan `freeze_blocks_until` metodu ile modelin katmanları kademeli olarak eğitilir. Eğitim sırasında, belirli koşullar altında (şu anki uygulamada Blok 2, 15. epokta açılmaya zorlanır; Blok 3'ün açılması ise engellenir) diğer bloklar dondurulmuş durumdan çıkarılır.
 
 ## GPU Performans Optimizasyonları
 
 Proje, GPU performansını en üst düzeye çıkarmak ve eğitim sürecini hızlandırmak için çeşitli modern teknolojiler ve teknikler kullanır:
 
-*   **Otomatik Karışık Hassasiyet (Automatic Mixed Precision - AMP):**
-    *   `torch.amp.autocast` ve `torch.cuda.amp.GradScaler` kullanarak hem hız hem de bellek verimliliği için Float32 ve Float16 veri tiplerini dinamik olarak karıştırır. Uyumlu GPU'larda (Tensor Core gibi) daha hızlı matematik işlemleri sağlar ve bellek kullanımını optimize eder.
-
-*   **Gradiyent Biriktirme (Gradient Accumulation):**
-    *   `GRADIENT_ACCUMULATION_STEPS` ile belirtilen adımlarla gradyanları biriktirerek daha büyük bir "efektif batch boyutu" simüle eder. Bu, GPU belleği kısıtlıyken bile büyük batch boyutlarının faydalarından yararlanmayı sağlar.
-
+*   **Otomatik Karışık Hassasiyet (Automatic Mixed Precision - AMP):** `torch.amp.autocast` ve `torch.cuda.amp.GradScaler` kullanarak hem hız hem de bellek verimliliği için Float32 ve Float16 veri tiplerini dinamik olarak karıştırır. Uyumlu GPU'larda (Tensor Core gibi) daha hızlı matematik işlemleri sağlar ve bellek kullanımını optimize eder. `amp_enabled` bayrağı ile kontrol edilir ve yalnızca CUDA cihazı mevcut ve BF16 destekliyorsa etkinleştirilir.
+*   **Gradiyent Biriktirme (Gradient Accumulation):** `GRADIENT_ACCUMULATION_STEPS` (varsayılan 4) ile belirtilen adımlarla gradyanları biriktirerek daha büyük bir "efektif batch boyutu" simüle eder. Bu, GPU belleği kısıtlıyken bile büyük batch boyutlarının faydalarından yararlanmayı sağlar. `loss / GRADIENT_ACCUMULATION_STEPS).backward()` ile uygulanır.
 *   **`DataLoader` Optimizasyonları:**
-    *   **`num_workers`:** Veri yüklemesini ayrı alt işlemlere dağıtarak CPU'nun veri hazırlığına, GPU'nun ise model eğitimine odaklanabilmesini sağlar. (Windows için kısıtlamalar nedeniyle otomatik olarak 0'a ayarlanır).
+    *   **`num_workers`:** Veri yüklemesini ayrı alt işlemlere dağıtarak CPU'nun veri hazırlığına, GPU'nun ise model eğitimine odaklanabilmesini sağlar. Windows işletim sistemleri için `0` olarak ayarlanır ve `persistent_workers` devre dışı bırakılır (`freeze_support_for_win` fonksiyonu ile).
     *   **`pin_memory=True`:** Verinin GPU'ya kopyalanmasını hızlandırmak için CPU belleğinde sabitlenmiş bir alana yüklenmesini sağlar.
-    *   **`persistent_workers=True`:** `DataLoader` alt işlemlerinin epochlar arasında yeniden başlatılmasını engelleyerek ek yükü azaltır ve veri yükleme süresini kısaltır. (Windows için kısıtlamalar nedeniyle devre dışı bırakılabilir).
-
+    *   **`persistent_workers=True`:** `DataLoader` alt işlemlerinin epochlar arasında yeniden başlatılmasını engelleyerek ek yükü azaltır ve veri yükleme süresini kısaltır. (Windows için kısıtlamalar nedeniyle otomatik olarak `False` olarak ayarlanır).
+    *   **`drop_last=True`:** Son batch'in tam olmaması durumunda atılmasını sağlar, bu da model boyutları veya batch norm gibi bazı mimariler için daha kararlı eğitim sağlayabilir.
 *   **GPU Bellek Yönetimi:**
-    *   **`torch.cuda.empty_cache()`:** GPU üzerindeki önbelleği boşaltarak bellek fragmentasyonunu ve gereksiz bellek kullanımını azaltır.
-    *   **`gc.collect()`:** Python'ın çöp toplayıcısını manuel olarak tetikleyerek GPU belleğinin daha verimli serbest bırakılmasına yardımcı olur.
+    *   **`torch.cuda.empty_cache()`:** GPU üzerindeki önbelleği boşaltarak bellek fragmentasyonunu ve gereksiz bellek kullanımını azaltır. Her epoch sonunda çağrılır.
+    *   **`gc.collect()`:** Python'ın çöp toplayıcısını manuel olarak tetikleyerek GPU belleğinin daha verimli serbest bırakılmasına yardımcı olur. Her epoch sonunda çağrılır.
     *   **`set_to_none=True` ile `optim.zero_grad()`:** Gradyan tensörlerini doğrudan sıfırlamak yerine `None` olarak ayarlayarak bellek tahsisini optimize eder.
-
 *   **`ConvBlock` İyileştirmeleri (Dolaylı Etki):**
     *   **`GroupNorm`:** Daha küçük batch boyutlarında stabilite sağlar ve bazı GPU mimarilerinde performansı artırabilir.
     *   **`kernel_size=3`:** Daha az hesaplama gerektirir ve daha derin ağların daha verimli çalışmasına olanak tanır.
@@ -123,31 +110,30 @@ Proje, GPU performansını en üst düzeye çıkarmak ve eğitim sürecini hızl
 
 ## Veri Yükleme ve Ön İşleme (dataset/custom_dataset.py)
 
-Veri seti işlemleri için özel bir PyTorch `Dataset` sınıfı kullanılmıştır:
+Veri seti işlemleri için özel bir PyTorch `Dataset` sınıfı (`CustomTumorDataset`) kullanılmıştır:
 
-*   **`CustomTumorDataset`:** `.npy` formatındaki ön işlenmiş görüntülerden veri yükler.
-*   **Önbellekleme:** Sık erişilen veriler için bellek önbelleklemesi kullanır.
-*   **Görüntü Artırma ve Dönüşümler:** `Albumentations` kütüphanesi ile çeşitli rastgele dönüşümler uygulanır. Bu dönüşümler eğitim epoklarına göre dinamik olarak ayarlanır:
-    *   **Erken Eğitim Fazı (0-10 Epok):** Modelin daha çeşitli verilere maruz kalması için daha yüksek şiddetli artırmalar uygulanır.
-        *   `A.Rotate(limit=5, p=0.3)`: Görüntüleri 5 dereceye kadar döndürme olasılığı 0.3.
-        *   `A.RandomRotate90(p=0.1)`: Görüntüleri 90 derece döndürme olasılığı 0.1.
-        *   `A.OneOf([A.HorizontalFlip(p=1.0), A.VerticalFlip(p=1.0)], p=0.3)`: Yatay veya dikey çevirme olasılığı 0.3.
-        *   `A.Affine(translate_percent={'x': 0.02, 'y': 0.02}, scale={'x': (0.96, 1.04), 'y': (0.96, 1.04)}, p=0.3)`: Hafif çeviri ve ölçekleme olasılığı 0.3.
-        *   `A.RandomBrightnessContrast(brightness_limit=0.08, contrast_limit=0.08, p=0.3)`: Parlaklık ve kontrast ayarlama olasılığı 0.3.
-        *   `A.GaussNoise(std_range=(0.005, 0.015), mean_range=(0.0, 0.0), p=0.1)`: Gauss gürültüsü ekleme olasılığı 0.1.
-    *   **Orta Eğitim Fazı (10-40 Epok):** Artırmaların şiddeti ve olasılıkları azaltılarak modelin daha oturmuş öğrenmesine olanak tanınır.
+*   **`CustomTumorDataset`:** `.npy` formatındaki ön işlenmiş görüntülerden veri yükler. Bu, veri okuma hızını artırır.
+*   **Görüntü Artırma ve Dönüşümler:** `Albumentations` kütüphanesi ile çeşitli rastgele dönüşümler uygulanır. Bu dönüşümler eğitim epoklarına göre dinamik olarak ayarlanır (`_get_current_augmenter` metodu):
+    *   **Erken Eğitim Fazı (0-10 Epok):** Modelin daha çeşitli verilere maruz kalması için daha yüksek şiddetli artırmalar uygulanır. Bu aşama, modelin ilk öğrenme eğrisini hızlandırmasına yardımcı olur.
+        *   `A.Rotate(limit=5, p=0.3)`
+        *   `A.RandomRotate90(p=0.1)`
+        *   `A.OneOf([A.HorizontalFlip(p=1.0), A.VerticalFlip(p=1.0)], p=0.3)`
+        *   `A.Affine(translate_percent={'x': 0.02, 'y': 0.02}, scale={'x': (0.96, 1.04), 'y': (0.96, 1.04)}, p=0.3)`
+        *   `A.RandomBrightnessContrast(brightness_limit=0.08, contrast_limit=0.08, p=0.3)`
+        *   `A.GaussNoise(std_range=(0.005, 0.015), mean_range=(0.0, 0.0), p=0.1)`
+    *   **Orta Eğitim Fazı (10-40 Epok):** Artırmaların şiddeti ve olasılıkları azaltılarak modelin daha oturmuş öğrenmesine olanak tanınır. Bu, modelin daha ince detayları öğrenmesine yardımcı olur.
         *   `A.Rotate(limit=3, p=0.1)`
         *   `A.RandomRotate90(p=0.05)`
         *   `A.OneOf([A.HorizontalFlip(p=1.0), A.VerticalFlip(p=1.0)], p=0.1)`
         *   `A.Affine(translate_percent={'x': 0.005, 'y': 0.005}, scale={'x': (0.99, 1.01), 'y': (0.99, 1.01)}, p=0.1)`
         *   `A.RandomBrightnessContrast(brightness_limit=0.02, contrast_limit=0.02, p=0.1)`
         *   `A.GaussNoise(std_range=(0.003, 0.008), mean_range=(0.0, 0.0), p=0.05)`
-    *   **Son Eğitim Fazı (40+ Epok):** Minimal artırmalar uygulanır, genellikle sadece temel dönüşümlerle modelin ince ayar yapmasına izin verilir.
-        *   `A.HorizontalFlip(p=1.0)`: Görüntüleri her zaman yatay çevir.
+    *   **Son Eğitim Fazı (40+ Epok):** Minimal artırmalar uygulanır, genellikle sadece temel dönüşümlerle modelin ince ayar yapmasına izin verilir. Bu aşama, modelin genelleme yeteneğini optimize etmeye odaklanır.
+        *   `A.HorizontalFlip(p=1.0)`
     *   **Sabit Dönüşümler:** Tüm artırma aşamalarından sonra uygulanan sabit dönüşümler:
-        *   `A.Resize(224, 224)`: Görüntüleri hedef boyut olan 224x224 piksele yeniden boyutlandırır.
-        *   `A.Normalize(mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5))`: Piksel değerlerini [-1, 1] aralığına normalize eder.
-        *   `ToTensorV2()`: Son adımda NumPy dizilerini PyTorch tensörlerine dönüştürür.
+        *   `A.Resize(224, 224)`
+        *   `A.Normalize(mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5))`
+        *   `ToTensorV2()`
 
 ## Yardımcı Betikler
 
