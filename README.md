@@ -181,5 +181,4 @@ weighted avg       0.98      0.98      0.98       912
 ---
 ```
 
-confusion matrix :
 ![FCwvqas.md.png](https://iili.io/FCwvqas.md.png)
