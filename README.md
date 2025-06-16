@@ -156,6 +156,24 @@ python models/train.py
 # Modeli test edin (eğitimden sonra)
 python test.py
 ```
+~~python test.py
+🔁 Veri yükleniyor...
+🤖 Eğitilmiş model models\full_vgg_custom.pt yüklendi.
+🔍 Tahminler yapılıyor...
 
+🎯 912 test örneğinden 891 tanesi doğru tahmin edildi.
+✅ Doğruluk Oranı: 97.70%
+📈 Karışıklık Matrisi çiziliyor...
+
+Sınıflandırma Raporu:
+              precision    recall  f1-score   support
+
+    0_glioma       0.99      0.98      0.99       302
+     1_menin       0.98      0.95      0.97       302
+     2_tumor       0.96      1.00      0.98       308
+
+    accuracy                           0.98       912
+   macro avg       0.98      0.98      0.98       912
+weighted avg       0.98      0.98      0.98       912
 ---
 
