@@ -135,6 +135,34 @@ Veri seti işlemleri için özel bir PyTorch `Dataset` sınıfı (`CustomTumorDa
         *   `A.Normalize(mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5))`
         *   `ToTensorV2()`
 
+## Veri Seti Kurulumu
+
+Bu proje, Kaggle üzerindeki [Beyin Kanseri MRI Veri Seti](https://www.kaggle.com/datasets/orvile/brain-cancer-mri-dataset) ile uyumlu olacak şekilde tasarlanmıştır. Projeyi çalıştırmak için aşağıdaki adımları takip ederek veri setini hazırlamanız gerekmektedir:
+
+1.  **Veri Setini İndirme:**
+    *   Yukarıdaki Kaggle bağlantısından "Brain Cancer MRI Dataset"i indirin.
+    *   İndirilen zip dosyasını açın.
+
+2.  **Veri Klasörlerini Düzenleme:**
+    *   Projenin kök dizininde (README.md'nin bulunduğu yerde) `data` adında bir klasör oluşturun.
+    *   İndirdiğiniz veri setindeki sınıf klasörlerini (`brain_glioma`, `brain_menin`, `brain_tumor`) doğrudan `data` klasörünün altına yerleştirin. `train`, `val`, `test` alt klasörlerini manuel olarak oluşturmanıza gerek yoktur; `preprocess_data.py` betiği bu ayrımı otomatik olarak yapacaktır. Örnek yapı:
+        ```
+        BrainMRIModel/
+        ├── data/
+        │   ├── brain_glioma/
+        │   ├── brain_menin/
+        │   └── brain_tumor/
+        ```
+    *   Kaggle veri setindeki orijinal klasör isimleri farklı olabilir (`brain_glioma`, `brain_menin`,  `brain_tumor`). **Ancak, `preprocess_data.py` betiği bu isimleri projenin beklediği `0_glioma`, `1_menin`, `2_tumor` formatına otomatik olarak dönüştürecektir. Bu nedenle, manuel olarak yeniden adlandırmanıza gerek yoktur.**
+
+3.  **Veri Ön İşleme ve `.npy` Dönüştürme:**
+    *   Proje, eğitim için `preprocessed_data` klasörlerinde `.npy` uzantılı ön işlenmiş görüntü dosyalarını beklemektedir. `dataset/custom_dataset.py` dosyası bu `.npy` dosyalarını okur.
+    *   **Güncelleme:** Artık bu işlem için bir betik bulunmaktadır. Proje kök dizininde `preprocess_data.py` adında bir betik oluşturulmuştur. Ham verileri `data` klasörüne yerleştirdikten sonra bu betiği çalıştırarak `.npy` formatındaki ön işlenmiş verileri `preprocessed_data` klasörüne otomatik olarak oluşturabilirsiniz:
+        ```bash
+        python -m preprocess_data
+        ```
+    *   **Önemli Not:** `.gitignore` dosyası `data/` ve `preprocessed_data/` klasörlerini versiyon kontrolünden hariç tutar. Bu klasörleri projenin içine indirip düzenledikten sonra, Git deposuna yüklenmeyeceklerdir.
+
 ## Yardımcı Betikler
 
 *   **`test.py`:** Eğitilmiş modelin test veri seti üzerindeki performansını değerlendirmek için kullanılır. Hem en iyi modeli hem de SWA modelini test edebilir.
@@ -151,10 +179,10 @@ Projeyi çalıştırmak için gerekli bağımlılıkları yüklemeniz ve ardınd
 pip install -r requirements.txt
 
 # Modeli eğitin
-python models/train.py
+python -m models.train
 
 # Modeli test edin (eğitimden sonra)
-python test.py
+python -m test
 ```
 ~~python test.py
 🔁 Veri yükleniyor...
