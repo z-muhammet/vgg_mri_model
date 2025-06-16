@@ -1,6 +1,9 @@
+
 # BrainMRIModel
 
 Bu proje, beyin MRI görüntülerinden tümör tespiti ve sınıflandırması için derin öğrenme tabanlı bir model geliştirmeyi amaçlamaktadır. Proje, PyTorch çerçevesini kullanarak özel bir Evrişimsel Sinir Ağı (CNN) mimarisi eğitir ve model performansını artırmak için çeşitli gelişmiş eğitim stratejileri ve veri artırma teknikleri kullanır.
+
+![FCwe9UJ.md.png](https://iili.io/FCwe9UJ.md.png)
 
 ## Kullanılan Teknolojiler ve Kütüphaneler
 
@@ -204,4 +207,6 @@ Sınıflandırma Raporu:
    macro avg       0.98      0.98      0.98       912
 weighted avg       0.98      0.98      0.98       912
 ---
+```
 
+![FCwvqas.md.png](https://iili.io/FCwvqas.md.png)
